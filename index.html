@@ -249,6 +249,22 @@
     opacity:0; pointer-events:none; transition:all .25s; box-shadow:var(--shadow); max-width:calc(100% - 40px); text-align:center;
   }
   .toast.on{ opacity:1; transform:translate(-50%, 0); }
+  /* ---------- persistent new-order alerts (admin) ---------- */
+  .orderalerts{ position:fixed; top:calc(10px + env(safe-area-inset-top)); left:50%; transform:translateX(-50%); z-index:120; width:min(560px, calc(100% - 20px)); display:flex; flex-direction:column; gap:8px; max-height:72dvh; overflow-y:auto; }
+  .orderalerts:empty{ display:none; }
+  .oalert{ background:var(--surface); border:2px solid var(--red); border-radius:16px; box-shadow:var(--shadow); padding:13px 14px; }
+  .oalert-head{ display:flex; align-items:center; gap:8px; }
+  .oalert-dot{ width:10px; height:10px; border-radius:50%; background:var(--red); flex:none; animation:oalertpulse 1s ease-in-out infinite; }
+  @keyframes oalertpulse{ 0%,100%{ box-shadow:0 0 0 0 rgba(217,35,35,.45); } 50%{ box-shadow:0 0 0 6px rgba(217,35,35,0); } }
+  .oalert-head b{ font-size:.95rem; letter-spacing:.01em; }
+  .oalert-head span{ margin-left:auto; font-weight:800; color:var(--red-dark); font-size:.95rem; white-space:nowrap; }
+  .oalert-meta{ font-size:.82rem; color:var(--ink2); font-weight:600; margin-top:3px; line-height:1.5; }
+  .oalert-items{ font-size:.84rem; font-weight:600; color:var(--ink); margin-top:5px; line-height:1.55; }
+  .oalert-actions{ display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  .oalert-actions .acceptbtn{ flex:1; min-width:150px; background:var(--red); color:#fff; border:0; border-radius:12px; font:inherit; font-weight:800; font-size:.92rem; padding:12px; min-height:3rem; cursor:pointer; }
+  .oalert-actions .acceptbtn:active{ background:var(--red-dark); }
+  .oalert-actions .viewbtn{ background:var(--surface); color:var(--ink); border:1.5px solid var(--line); border-radius:12px; font:inherit; font-weight:800; font-size:.85rem; padding:12px 16px; min-height:3rem; cursor:pointer; }
+  @media (prefers-reduced-motion: reduce){ .oalert-dot{ animation:none; } }
   @media (prefers-reduced-motion: reduce){
     html{ scroll-behavior:auto; }
     .cartbar, .sheet, .scrim, .toast{ transition:none; }
@@ -465,6 +481,11 @@
 </div>
 
 <div class="toast" id="toast" role="status"></div>
+
+<!-- Persistent new-order alerts for the owner: each card stays pinned on
+     top of the screen, with its own Accept button, until that order is
+     accepted. Filled by renderOrderAlerts() in the script below. -->
+<div class="orderalerts" id="orderAlerts" aria-live="assertive"></div>
 
 <script>
 /* =====================================================================
@@ -854,14 +875,153 @@ function subscribeRealtime(){
         var isNew = payload.eventType === "INSERT";
         fetchCloudOrders(function(){
           refreshCustomerTracking(); /* customer's own live status tracker */
-          if ($("adminView").classList.contains("on") && adminUnlocked) {
-            renderAdmin();
-            if (isNew) { beep(); toast("New order received!"); }
-          }
+          syncOrderAlerts(); /* an order accepted/cancelled anywhere stops its alert */
+          if (isNew && payload.new) alertNewOrder(rowToOrder(payload.new));
+          if ($("adminView").classList.contains("on") && adminUnlocked) renderAdmin();
         });
       })
       .subscribe();
   } catch(e){}
+}
+
+/* ================= NEW-ORDER ALERTS (admin) =================
+   When a new order arrives, the owner gets an alert that does NOT go
+   away on its own:
+   - a card stays pinned on top of the screen with the order details
+     and an "Accept order" button INSIDE the alert itself,
+   - the alert sound repeats every few seconds,
+   - a system notification is shown with requireInteraction, so it
+     stays on screen until the owner acts on it; tapping it opens the
+     panel with the pinned card and its Accept button right on top.
+   Everything stops the moment the order is accepted — from the alert
+   card, or from anywhere in the panel. Alerts are an owner feature:
+   they only fire on a device where the Owner Panel is unlocked. */
+var pendingAlerts = {}; /* order id -> order still waiting to be accepted */
+var alertedIds = {};    /* ids already alerted this session (no repeats) */
+var alertNotifs = {};   /* order id -> system Notification object */
+var alertSoundTimer = null;
+
+/* Browsers only let sound play after the owner has tapped something on
+   the page — unlock the audio context on the first tap anywhere. */
+document.addEventListener("pointerdown", function(){
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  } catch(e){}
+}, false);
+
+function alertSoundStart(){
+  beep();
+  if (alertSoundTimer) return;
+  alertSoundTimer = setInterval(function(){
+    if (!Object.keys(pendingAlerts).length) { alertSoundStop(); return; }
+    beep();
+  }, 4000);
+}
+function alertSoundStop(){ if (alertSoundTimer) { clearInterval(alertSoundTimer); alertSoundTimer = null; } }
+
+function alertNewOrder(o){
+  if (!o || !o.id || !adminUnlocked) return;
+  if (o.status && o.status !== "Placed") return;
+  var first = !alertedIds[o.id];
+  alertedIds[o.id] = 1;
+  pendingAlerts[o.id] = o;
+  renderOrderAlerts();
+  if (first) {
+    alertSoundStart();
+    fireOrderNotification(o);
+    toast("New order received — " + (o.table || "") + " • " + inr(o.total || 0));
+  }
+}
+function clearOrderAlert(id){
+  if (!pendingAlerts[id] && !alertNotifs[id]) return;
+  delete pendingAlerts[id];
+  if (alertNotifs[id]) { try { alertNotifs[id].close(); } catch(e){} delete alertNotifs[id]; }
+  renderOrderAlerts();
+  if (!Object.keys(pendingAlerts).length) alertSoundStop();
+}
+/* Keep the pinned alerts in step with the live order list: once an
+   order is no longer "Placed" (accepted / cancelled on any device),
+   its alert, notification and sound stop. */
+function syncOrderAlerts(){
+  if (!cloudOrders) return;
+  var byId = {};
+  cloudOrders.forEach(function(o){ byId[o.id] = o; });
+  var changed = false;
+  Object.keys(pendingAlerts).forEach(function(id){
+    var o = byId[id];
+    if (!o || o.status !== "Placed") { clearOrderAlert(id); changed = true; }
+    else if (pendingAlerts[id] !== o) { pendingAlerts[id] = o; changed = true; }
+  });
+  if (changed) renderOrderAlerts();
+}
+function renderOrderAlerts(){
+  var wrap = $("orderAlerts"); if (!wrap) return;
+  var ids = Object.keys(pendingAlerts);
+  if (!ids.length) { wrap.innerHTML = ""; return; }
+  wrap.innerHTML = ids.map(function(id){
+    var o = pendingAlerts[id];
+    var items = (o.lines || []).map(function(l){ return l.qty + " × " + esc(l.name); }).join(", ");
+    return '<div class="oalert" role="alert">'
+      + '<div class="oalert-head"><span class="oalert-dot"></span><b>NEW ORDER — ' + esc(o.table || "") + '</b><span>' + inr(o.total || 0) + '</span></div>'
+      + '<div class="oalert-meta">' + esc(o.id) + (o.name ? ' • ' + esc(o.name) : '') + (o.time ? ' • ' + esc(o.time) : '') + '</div>'
+      + (items ? '<div class="oalert-items">' + items + '</div>' : '')
+      + '<div class="oalert-actions"><button class="acceptbtn" type="button" data-alert-accept="' + esc(o.id) + '">✓ Accept order</button>'
+      + '<button class="viewbtn" type="button" data-alert-view="' + esc(o.id) + '">View</button></div></div>';
+  }).join("");
+  wrap.querySelectorAll("[data-alert-accept]").forEach(function(b){ b.addEventListener("click", function(){ acceptAlertOrder(b.getAttribute("data-alert-accept")); }); });
+  wrap.querySelectorAll("[data-alert-view]").forEach(function(b){ b.addEventListener("click", function(){ openAdminToOrder(); }); });
+}
+function acceptAlertOrder(id){
+  clearOrderAlert(id); /* stop this order's sound + notification at once */
+  setOrderStatus(id, "Accepted");
+}
+function openAdminToOrder(){
+  try { window.focus(); } catch(e){}
+  if (!$("adminView").classList.contains("on")) $("openAdminBtn").click();
+  if (adminUnlocked) { adminRange = "live"; renderAdmin(); }
+}
+/* System notification for a new order. requireInteraction keeps it on
+   screen until the owner dismisses or taps it — it never fades away by
+   itself. Tapping it opens the panel with the pinned order card and
+   its working Accept button right on top. (A plain web page cannot put
+   a working button inside the system notification itself — that needs
+   a service worker — so the Accept button lives in the pinned card,
+   one tap away, and the repeating sound keeps going until it is used.) */
+function fireOrderNotification(o){
+  try {
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    var items = (o.lines || []).map(function(l){ return l.qty + " × " + l.name; }).join(", ");
+    var n = new Notification("New order — " + (o.table || "") + " • " + inr(o.total || 0), {
+      body: (o.name ? o.name + " • " : "") + items + "\nTap to open — the Accept button is on the order card at the top.",
+      tag: "wt-order-" + o.id,
+      requireInteraction: true
+    });
+    n.onclick = function(){ openAdminToOrder(); };
+    alertNotifs[o.id] = n;
+  } catch(e){}
+}
+function notifyPermissionState(){
+  if (!("Notification" in window)) return "unsupported";
+  return Notification.permission; /* default | granted | denied */
+}
+function requestNotifyPermission(cb){
+  if (!("Notification" in window)) { if (cb) cb("unsupported"); return; }
+  if (Notification.permission !== "default") { if (cb) cb(Notification.permission); return; }
+  try {
+    var p = Notification.requestPermission(function(res){ if (cb) cb(res); });
+    if (p && p.then) p.then(function(res){ if (cb) cb(res); }, function(){});
+  } catch(e){ if (cb) cb(Notification.permission); }
+}
+/* Catch-up: an order that arrived while the panel was locked still
+   needs accepting — after login, alert for every Placed order from
+   the last 30 minutes that has not been alerted yet. */
+function catchUpOrderAlerts(){
+  if (!adminUnlocked) return;
+  var cutoff = Date.now() - 30 * 60 * 1000;
+  allOrdersSource().forEach(function(o){
+    if (o.status === "Placed" && (o.ts || 0) >= cutoff) alertNewOrder(o);
+  });
 }
 var SQL_SCHEMA = "create table public.orders (\n  id text primary key,\n  table_label text not null check (table_label in ('Table 1','Table 2','Table 3','Table 4','Table 5','Table 6','Table 7','Table 8','Table 9','Table 10','Table 11','Table 12','Takeaway')),\n  customer_name text check (char_length(customer_name) <= 60),\n  note text check (char_length(note) <= 200),\n  payment text check (payment in ('Pay at counter','UPI')),\n  lines jsonb not null default '[]'::jsonb check (jsonb_typeof(lines) = 'array' and jsonb_array_length(lines) between 1 and 100),\n  subtotal integer not null default 0 check (subtotal between 0 and 100000),\n  gst integer not null default 0 check (gst between 0 and 5000),\n  total integer not null default 0 check (total between 1 and 105000),\n  status text not null default 'Placed' check (status in ('Placed','Accepted','Preparing','Ready','Completed','Cancelled')),\n  created_at timestamptz not null default now(),\n  check (total = subtotal + gst),\n  check (abs(gst - round(subtotal * 0.05)) <= 1)\n);\nalter table public.orders enable row level security;\ncreate policy \"anon can place orders\" on public.orders\n  for insert to anon with check (status = 'Placed');\ncreate policy \"anon and admin can read orders\" on public.orders\n  for select to anon, authenticated using (true);\ncreate policy \"anon and admin can update status only\" on public.orders\n  for update to anon, authenticated using (true)\n  with check (status in ('Placed','Accepted','Preparing','Ready','Completed','Cancelled'));\nrevoke update on table public.orders from anon, authenticated;\ngrant update (status) on table public.orders to anon, authenticated;\ngrant select, insert on table public.orders to anon, authenticated;\nalter publication supabase_realtime add table public.orders;";
 /* ================= RENDER MENU ================= */
@@ -1364,6 +1524,10 @@ function renderAdmin(){
     + '</div>'
     + '<div class="searchrow"><input id="adminSearch" type="search" placeholder="Search by order ID, name or table…" value="'+esc(adminSearch)+'" /><select id="adminStatusSel" aria-label="Filter by status">'+statusOpts+'</select>'
     + '<button class="btn" id="exportCsvBtn" type="button">⬇ Export CSV</button><button class="btn" id="refreshAdminBtn" type="button">↻ Refresh</button></div>'
+    + '<div class="panelcard"><h4>Order alerts — notification + sound</h4>'
+    + '<p style="margin:0 0 8px;color:var(--ink2);font-weight:600;font-size:.86rem;line-height:1.55;">Naya order aate hi is device pe <b>notification</b> aayega jo screen pe <b>tika rahega</b>, ek alert card upar chipka rahega jiske andar hi <b>Accept order</b> ka button hoga, aur awaaz har kuch seconds me bajti rahegi — <b>jab tak order accept nahi hota, alert nahi hatega</b>. Browser notification ke liye ek baar permission chahiye (neeche button se do). Panel band karke menu dekh rahe ho tab bhi alert upar dikhega; bas panel is device pe <b>unlocked</b> hona chahiye.</p>'
+    + '<div class="dbstatus" style="margin-top:0;">Notifications: <b>' + (notifyPermissionState() === "granted" ? "ON — naya order aane pe notification milega" : notifyPermissionState() === "denied" ? "BLOCKED — browser ke site settings me jaake is website ke liye Notifications Allow karo" : notifyPermissionState() === "unsupported" ? "Is browser me system notification nahi chalta — screen wala alert + awaaz phir bhi chalega" : "Abhi ON nahi hai — neeche wala button dabake Allow karo") + '</b></div>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;"><button class="btn teal" id="enableNotifyBtn" type="button">Enable notifications</button><button class="btn" id="testAlertBtn" type="button">Test alert sound</button></div></div>'
     + ordersHTML
     + '<div class="panelcard"><h4>Revenue — last 7 days</h4>'+daysHTML+'</div>'
     + '<div class="panelcard"><h4>Top-selling items</h4><div class="toplist">'+topsHTML+'</div><h4 style="margin-top:14px;">Orders by table</h4><div class="toplist">'+tablesHTML+'</div></div>'
@@ -1422,6 +1586,8 @@ function renderAdmin(){
   var cdb=$("clearDbBtn"); if(cdb) cdb.addEventListener("click", function(){ disconnectDb(); try{ if(sbClient && realtimeChannel) sbClient.removeChannel(realtimeChannel); }catch(e){} realtimeChannel=null; cloudOrders=null; initSupabase(); renderAdmin(); toast("Database disconnected on this device — Local only mode"); });
   var csq=$("copySqlBtn"); if(csq) csq.addEventListener("click", function(){ if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(SQL_SCHEMA).then(function(){ toast("SQL copied — paste it in Supabase SQL Editor"); }, function(){ fallbackCopy(SQL_SCHEMA); toast("SQL copied"); }); else { fallbackCopy(SQL_SCHEMA); toast("SQL copied"); } });
   var ex=$("exportCsvBtn"); if(ex) ex.addEventListener("click", exportCSV);
+  var enb=$("enableNotifyBtn"); if(enb) enb.addEventListener("click", function(){ requestNotifyPermission(function(res){ renderAdmin(); toast(res === "granted" ? "Notifications ON — naya order aane pe notification + awaaz aayegi" : res === "denied" ? "Notification blocked hai — browser settings se is site ke liye Allow karo" : res === "unsupported" ? "Is browser me notification nahi chalta — screen alert + awaaz chalega" : "Permission nahi mili — dobara try karo"); }); });
+  var tab=$("testAlertBtn"); if(tab) tab.addEventListener("click", function(){ beep(); toast("Ye wahi awaaz hai jo naya order aane pe bajti rahegi — jab tak Accept na ho"); });
   body.querySelectorAll("[data-advance]").forEach(function(b){ b.addEventListener("click", function(){ setOrderStatus(b.getAttribute("data-advance"), NEXT_STATUS[(allOrdersSource().find(function(o){return o.id===b.getAttribute("data-advance");})||{}).status]); }); });
   body.querySelectorAll("[data-setstatus]").forEach(function(b){ b.addEventListener("click", function(){ var p=b.getAttribute("data-setstatus").split("|"); setOrderStatus(p[0], p[1]); }); });
   var rq=$("regenQrBtn"); if(rq) rq.addEventListener("click", function(){ var v=($("qrLinkInput").value||"").trim(); if(!v){ toast("Paste the published website link first"); return; } setQrLink(v); drawTableQRs(v); toast("5 table QRs generated — print each one for its own table"); });
@@ -1454,7 +1620,7 @@ function renderAdmin(){
       var np=$("newPass"); if(np) np.value="";
     }, function(){ sp.disabled = false; toast("Network error — dobara try karo"); });
   });
-  var lk=$("lockAdminBtn"); if(lk) lk.addEventListener("click", function(){ adminUnlocked=false; adminUser=null; if (sbAuthClient && sbAuthClient.auth) sbAuthClient.auth.signOut(); renderAdmin(); toast("Panel locked — logged out"); });
+  var lk=$("lockAdminBtn"); if(lk) lk.addEventListener("click", function(){ Object.keys(pendingAlerts).forEach(function(id){ clearOrderAlert(id); }); alertSoundStop(); adminUnlocked=false; adminUser=null; if (sbAuthClient && sbAuthClient.auth) sbAuthClient.auth.signOut(); renderAdmin(); toast("Panel locked — logged out"); });
   var cd=$("clearDoneBtn"); if(cd) cd.addEventListener("click", function(){ $("confirmBox").innerHTML='<div class="notebox">Remove all Completed and Cancelled orders from history on this device?<div style="margin-top:8px;display:flex;gap:8px;"><button class="btn red small" id="confirmClearBtn" type="button">Yes, clear them</button><button class="btn small" id="cancelClearBtn" type="button">Cancel</button></div></div>'; $("confirmClearBtn").addEventListener("click", function(){ saveOrders(loadOrders().filter(function(o){ return o.status!=="Completed"&&o.status!=="Cancelled"; })); toast("Old orders cleared"); renderAdmin(); }); $("cancelClearBtn").addEventListener("click", renderAdmin); });
 }
 function drawQRInto(el, link, size){
@@ -1517,7 +1683,8 @@ function tryAdminLogin(){
     adminUnlocked = true;
     renderAdmin();
     toast("Welcome back, Owner");
-    if (cloudEnabled) fetchCloudOrders(function(){ if (adminUnlocked) renderAdmin(); });
+    requestNotifyPermission(); /* ask once, right after the login tap, so new-order notifications can show */
+    if (cloudEnabled) fetchCloudOrders(function(){ if (adminUnlocked) { renderAdmin(); catchUpOrderAlerts(); } });
   }, function(){ btnBack(); fail("Network error — connection check karke dobara try karo."); });
 }
 function setOrderStatus(id, status){
@@ -1526,6 +1693,7 @@ function setOrderStatus(id, status){
   if (cloudOrders) cloudOrders.forEach(function(o){ if(o.id===id) o.status=status; });
   if (lastOrder && lastOrder.id===id) lastOrder.status=status;
   renderAdmin(); renderTracking(); updateSuccessTrack(); toast(id+" → "+status);
+  syncOrderAlerts(); /* accepting/cancelling here also clears that order's pinned alert + sound */
   if (cloudEnabled) updateCloudStatus(id, status, function(ok){ if(!ok){ toast("Status saved on this device, but database update failed — check connection"); setSyncChip("error","Sync error"); } });
 }
 function exportCSV(){
@@ -1547,7 +1715,7 @@ $("openAdminBtn").addEventListener("click", function(){
       var s = r && r.data ? r.data.session : null;
       adminUnlocked = !!s; adminUser = s ? s.user : null;
       renderAdmin();
-      if (cloudEnabled) fetchCloudOrders(function(){ if (adminUnlocked) renderAdmin(); });
+      if (cloudEnabled) fetchCloudOrders(function(){ if (adminUnlocked) { renderAdmin(); catchUpOrderAlerts(); } });
     }, function(){ renderAdmin(); });
   } else renderAdmin();
   if (cloudEnabled) fetchCloudOrders(function(){ if (adminUnlocked) renderAdmin(); });
@@ -1584,15 +1752,15 @@ function ordersSignature(list){ return (list || []).map(function(o){ return o.id
 setInterval(function(){
   if (!cloudEnabled || !sbClient) return;
   var beforeSig = ordersSignature(cloudOrders);
-  var beforeCount = cloudOrders ? cloudOrders.length : 0;
+  var beforeIds = {};
+  (cloudOrders || []).forEach(function(o){ beforeIds[o.id] = 1; });
   fetchCloudOrders(function(ok){
     if (!ok || !cloudOrders) return;
     if (ordersSignature(cloudOrders) === beforeSig) return;
     refreshCustomerTracking(); /* customer's own live status tracker */
-    if ($("adminView").classList.contains("on") && adminUnlocked) {
-      renderAdmin();
-      if (cloudOrders.length > beforeCount) { beep(); toast("New order received!"); }
-    }
+    syncOrderAlerts(); /* an order accepted/cancelled anywhere stops its alert */
+    if (adminUnlocked) cloudOrders.forEach(function(o){ if (!beforeIds[o.id] && o.status === "Placed") alertNewOrder(o); });
+    if ($("adminView").classList.contains("on") && adminUnlocked) renderAdmin();
   });
 }, 15000);
 </script>

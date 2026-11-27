@@ -302,7 +302,8 @@
   .statcard small{ color:var(--ink2); font-weight:600; font-size:.76rem; }
   .panelcard{ background:var(--surface); border:1px solid var(--line); border-radius:18px; padding:16px; margin-top:12px; }
   .panelcard h4{ margin:0 0 10px; font-size:.96rem; }
-  .ordercard{ background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:14px; margin-top:10px; }
+  .ordercard{ background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:14px; margin-top:10px; transition:border-color .3s, box-shadow .3s; }
+  .ordercard.flashcard{ border-color:var(--red); box-shadow:0 0 0 3px rgba(217,35,35,.45), var(--shadow); }
   .orderhead{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:space-between; }
   .statuspill{ font-size:.7rem; font-weight:800; letter-spacing:.05em; padding:5px 9px; border-radius:999px; background:var(--surface2); border:1px solid var(--line); }
   .status-Placed{ background:#FFF3CD; } .status-Accepted{ background:#DDEAFE; } .status-Preparing{ background:#FFE4C7; } .status-Ready{ background:#D9F2DF; } .status-Completed{ background:#E7F6EC; } .status-Cancelled{ background:var(--red-soft); color:var(--red-dark); }
@@ -884,37 +885,111 @@ function retryPending(){
   chain.then(function(){ savePending(remain); if (remain.length < p.length) fetchCloudOrders(function(){ if (adminUnlocked) renderAdmin(); }); });
 }
 window.addEventListener("online", function(){ retryPending(); toast("Back online — syncing pending orders"); });
-/* new-order sound (admin) — the owner's own music file
-   (the audio element near the end of the body; a ~23s happy cooking
-   jingle). It plays in a
-   LOOP at full volume while a new-order pop-up is showing, and stops
-   the moment the admin taps Accept on that pop-up. If more orders are
-   queued, the next pop-up appears and the music starts again for it. */
+/* new-order sound (admin) — the owner's own music file (a ~23s happy
+   cooking jingle; the <audio> element near the end of the body names
+   the file). It plays in a LOOP at full volume while a new-order
+   pop-up is showing, and stops the moment the admin taps Accept on
+   that pop-up. If more orders are queued, the next pop-up appears
+   and the music starts again for it. Playback runs through the Web
+   Audio engine below (the element is only a fallback). */
 function alertAudioEl(){ return $("orderAlertAudio"); }
 /* Sound state — tracked honestly and shown in the Owner Panel:
-   audioUnlocked: a play() has REALLY succeeded on this device, so the
-     music can start by itself when an order arrives;
-   soundBlocked: the browser refused the last play() (autoplay rule —
-     no tap on this page yet, or sound blocked for this site), so the
-     panel and the pop-up show a one-tap "Enable sound" button;
+   audioUnlocked: sound is confirmed able to start BY ITSELF on this
+     device, so the music will play when an order arrives;
+   soundBlocked: the browser has not allowed sound in this tab yet
+     (no tap on this page the browser counts, or sound blocked for
+     this site), so the panel and the pop-up show a one-tap
+     "Enable sound" button;
    soundFileError: the music file itself failed to load. */
 var audioUnlocked = false;
 var soundBlocked = false;
 var soundFileError = false;
+
+/* ================= ALERT SOUND ENGINE — Web Audio =================
+   WHY THIS REPLACED THE <audio>-ELEMENT ENGINE (which kept failing on
+   the owner's laptop across several fixes): an element's play() is
+   re-judged by the autoplay policy on EVERY call, and its promise
+   races — a pause() anywhere rejects it with AbortError, the muted
+   unlock probe interfered with real playback, and one bad outcome
+   latched a false "BLOCKED" with every Chrome setting already ON.
+   A Web Audio context has none of those failure modes:
+   - the owner's music file is fetched and decoded ONCE into memory;
+   - the context needs ONE resume() inside a real tap in this tab
+     (the admin login tap already counts) — after that its state
+     stays "running" for the whole session;
+   - a looping source plays through a gain node: alert = gain up,
+     accept = gain down. At order time there is NO play() call to
+     refuse and NO promise to race — the sound simply turns on.
+   If Web Audio or the decode is unavailable on some browser, the
+   code falls back to the plain <audio> element path (elPlay /
+   elPause below), which keeps the previous behaviour. */
+var waCtx = null, waBuffer = null, waGain = null, waFailed = false, waInitStarted = false;
+function waInit(){
+  if (waCtx || waFailed || waInitStarted) return;
+  waInitStarted = true;
+  try {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC || !window.fetch) { waFailed = true; return; }
+    waCtx = new AC();
+    waGain = waCtx.createGain();
+    waGain.gain.value = 0;
+    waGain.connect(waCtx.destination);
+    var el = alertAudioEl();
+    var src = el ? el.getAttribute("src") : null;
+    if (!src) { waFailed = true; return; }
+    fetch(src).then(function(r){
+      if (!r.ok) throw new Error("http " + r.status);
+      return r.arrayBuffer();
+    }).then(function(buf){
+      return waCtx.decodeAudioData(buf);
+    }).then(function(decoded){
+      waBuffer = decoded;
+      var s = waCtx.createBufferSource();
+      s.buffer = decoded; s.loop = true;
+      s.connect(waGain);
+      s.start(0); /* runs silently through the zero gain until an alert raises it */
+      waSyncState();
+    }).catch(function(){ waFailed = true; waCtx = null; waGain = null; waBuffer = null; });
+  } catch(e){ waFailed = true; }
+}
+function waUsable(){ return !waFailed && !!waCtx; }
+function waRunning(){ return !!(waCtx && waBuffer && waCtx.state === "running"); }
+function waSyncState(){
+  if (waRunning() && (!audioUnlocked || soundBlocked)) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); }
+}
+function waResume(){
+  waInit();
+  if (!waCtx) return;
+  try {
+    if (waCtx.state !== "running") {
+      var p = waCtx.resume();
+      if (p && p.then) p.then(waSyncState, function(){
+        setTimeout(function(){ if (!waRunning() && !soundBlocked) { soundBlocked = true; updateSoundUI(); } }, 300);
+      });
+    }
+  } catch(e){}
+  waSyncState();
+}
+function waSetAudible(on){
+  if (!waCtx || !waGain) return;
+  try {
+    var t = waCtx.currentTime;
+    waGain.gain.cancelScheduledValues(t);
+    waGain.gain.setTargetAtTime(on ? 1 : 0, t, 0.03);
+  } catch(e){}
+}
+/* ---- fallback: the plain <audio> element (previous engine) ---- */
 function notePlayOutcome(p){
   if (p && p.then) p.then(function(){
     if (!audioUnlocked || soundBlocked) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); }
   }, function(err){
-    /* AbortError only means a pause() interrupted this play() (the
-       unlock probe, a test timer, an Accept tap) — the browser did
-       NOT block the sound. The old code treated EVERY rejection as a
-       block, so one interrupted play latched "Sound: BLOCKED" on the
-       panel even with every Chrome toggle ON, and nothing cleared it. */
+    /* AbortError only means a pause() interrupted this play() — the
+       browser did NOT block the sound; never latch BLOCKED for it. */
     if (err && err.name === "AbortError") return;
     if (!soundBlocked) { soundBlocked = true; updateSoundUI(); }
   });
 }
-function alertPlay(){
+function elPlay(){
   try {
     var a = alertAudioEl(); if (!a) return;
     try { a.muted = false; } catch(e){}
@@ -922,11 +997,32 @@ function alertPlay(){
     if (a.paused) notePlayOutcome(a.play());
     else if (!audioUnlocked || soundBlocked) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); }
   } catch(e){ if (!soundBlocked) { soundBlocked = true; updateSoundUI(); } }
+}
+function elPause(){
+  try { var a = alertAudioEl(); if (a) { a.pause(); a.currentTime = 0; } } catch(e){}
+}
+function alertPlay(){
   try { if (navigator.vibrate) navigator.vibrate([300, 120, 300, 120, 300]); } catch(e){}
+  if (waUsable()) {
+    waResume();
+    waSetAudible(true);
+    if (waRunning()) { if (!audioUnlocked || soundBlocked) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); } }
+    else if (waBuffer) {
+      /* Music is decoded but the context is not running yet — this
+         tab has had no tap the browser counts. The resume() above
+         settles within milliseconds when a tap IS in progress; only
+         latch the honest BLOCKED state if it is still not running
+         shortly after, so the pop-up shows its tap-to-enable button. */
+      setTimeout(function(){ if (!waRunning() && !soundBlocked) { soundBlocked = true; updateSoundUI(); } }, 350);
+    }
+    return;
+  }
+  elPlay();
 }
 function alertPause(){
-  try { var a = alertAudioEl(); if (a) { a.pause(); a.currentTime = 0; } } catch(e){}
   try { if (navigator.vibrate) navigator.vibrate(0); } catch(e){}
+  if (waUsable()) { waSetAudible(false); return; }
+  elPause();
 }
 function soundStatusHTML(){
   if (soundFileError) return 'Sound: <b>ERROR — music file load nahi ho payi. Page reload karke phir Enable sound dabao.</b>';
@@ -948,36 +1044,49 @@ function updateSoundUI(){
 var soundTestUntil = 0;
 function soundWanted(){ return !!currentAlertId() || Date.now() < soundTestUntil; }
 function maybeStopSound(){ if (!soundWanted()) alertPause(); }
+/* Is the music REALLY audible right now? Web Audio: the context is
+   running with the file decoded (the alert gain is up whenever this
+   is checked). Fallback element: actually playing with data ready. */
+function soundReallyPlaying(){
+  if (waUsable()) return waRunning();
+  var a = alertAudioEl();
+  return !!(a && !a.paused && a.readyState >= 2);
+}
+/* Honest verification for Enable / Test: wait until the music is
+   really playing before claiming success — and while the file is
+   still decoding (first seconds after page load), keep re-checking
+   for a few seconds instead of declaring a false failure. */
+function verifySoundToast(okMsg, failMsg){
+  var tries = 0;
+  (function check(){
+    if (soundReallyPlaying()) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); if (okMsg) toast(okMsg); return; }
+    if (waUsable() && !waBuffer && tries < 3) { tries++; setTimeout(check, 1000); return; }
+    soundBlocked = true; updateSoundUI(); if (failMsg) toast(failMsg);
+  })();
+}
 /* One-tap "Enable sound": runs inside the owner's tap, so the browser
    must allow it. Plays the real jingle for a few seconds as proof and
    marks the sound unlocked for future orders. */
 function enableSound(){
-  var a = alertAudioEl(); if (!a) { toast("Sound element nahi mila — page reload karo"); return; }
+  if (!waUsable() && !alertAudioEl()) { toast("Sound element nahi mila — page reload karo"); return; }
+  waInit(); waResume();
   soundTestUntil = Date.now() + 6000; /* this tap's playback is wanted for 6s */
-  try { a.currentTime = 0; } catch(e){}
   alertPlay();
   if (testSoundTimer) clearTimeout(testSoundTimer);
   testSoundTimer = setTimeout(maybeStopSound, 6100);
-  setTimeout(function(){
-    var aa = alertAudioEl();
-    if (aa && !aa.paused && aa.readyState >= 2) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); toast("✓ Sound ON ho gaya — ab naya order aate hi music apne aap bajegi"); }
-    else { soundBlocked = true; updateSoundUI(); toast("✗ Phir bhi nahi baja — Chrome me lock (🔒) icon → Site settings → Sound → Allow karo, phir ye button dobara dabao"); }
-  }, 900);
+  setTimeout(function(){ verifySoundToast("✓ Sound ON ho gaya — ab naya order aate hi music apne aap bajegi", "✗ Phir bhi nahi baja — Chrome me lock (🔒) icon → Site settings → Sound → Allow karo, phir ye button dobara dabao"); }, 900);
 }
 /* "Test alert sound" button: play the same jingle for a few seconds,
    then stop it again (unless a real order pop-up is up) — and report
    HONESTLY whether the music is really playing, not just requested. */
 var testSoundTimer = null;
 function beep(){
+  waInit(); waResume();
   soundTestUntil = Date.now() + 8000; /* this tap's playback is wanted for 8s */
   alertPlay();
   if (testSoundTimer) clearTimeout(testSoundTimer);
   testSoundTimer = setTimeout(maybeStopSound, 8100);
-  setTimeout(function(){
-    var a = alertAudioEl();
-    if (a && !a.paused && a.readyState >= 2) toast("✓ Sound chal raha hai — yahi music naya order aane pe Accept dabane tak loop me bajegi");
-    else { soundBlocked = true; updateSoundUI(); toast("✗ Sound nahi baja — 🔊 Enable sound dabao; phir bhi na baje to Chrome site settings me Sound = Allow karo"); }
-  }, 900);
+  setTimeout(function(){ verifySoundToast("✓ Sound chal raha hai — yahi music naya order aane pe Accept dabane tak loop me bajegi", "✗ Sound nahi baja — 🔊 Enable sound dabao; phir bhi na baje to Chrome site settings me Sound = Allow karo"); }, 900);
 }
 function subscribeRealtime(){
   if (!cloudEnabled || !sbClient || realtimeChannel) return;
@@ -1028,18 +1137,18 @@ function currentAlertId(){ return alertQueue.length ? alertQueue[0] : null; }
 /* Browsers only let a page play sound after the owner has tapped or
    typed something on it IN THIS TAB — clicks on Chrome's own panels
    (the lock-icon site panel, settings pages) do NOT count, and a
-   restored login session has had no tap at all. That is why an order
-   can arrive with every Chrome toggle ON and the first automatic
-   play() is still refused: the panel then honestly shows BLOCKED.
-   So the audio is probed on the owner's interactions — and RETRIED
-   on every interaction until sound is confirmed working (the old
-   guard stopped retrying once a probe had succeeded, even if a
-   later state had latched BLOCKED again). If a pop-up is already up
-   but silent, any tap anywhere retries the music at full volume
-   inside that tap, which the browser always allows; the pop-up also
-   grows its own "Enable sound" button while sound is unconfirmed. */
+   restored login session has had no tap at all. So EVERY tap and
+   keypress in this tab resumes the Web Audio context (waResume) —
+   one successful resume licenses order-time sound for the rest of
+   the session, and it is retried on every gesture until confirmed.
+   If a pop-up is already up but silent, any tap anywhere restarts
+   the music inside that tap; the pop-up also grows its own
+   "Enable sound" button while sound is unconfirmed. The muted
+   <audio>-element probe below now runs ONLY as the fallback for
+   browsers where Web Audio is unavailable. */
 var unlockBusy = false;
 function tryUnlockAudio(){
+  if (waUsable()) { waResume(); return; }
   var a = alertAudioEl(); if (!a || unlockBusy) return;
   if (audioUnlocked && !soundBlocked) return; /* confirmed working — nothing to do */
   unlockBusy = true;
@@ -1071,13 +1180,14 @@ function tryUnlockAudio(){
   } catch(e){ unlockBusy = false; try { var aa = alertAudioEl(); if (aa) aa.muted = false; } catch(e2){} }
 }
 function soundGesture(){
+  waInit();
   if (currentAlertId()) alertPlay(); /* pop-up up but silent: this tap retries the music */
   else tryUnlockAudio();
 }
 document.addEventListener("pointerdown", soundGesture, false);
 document.addEventListener("keydown", soundGesture, false);
-document.addEventListener("visibilitychange", function(){ if (!document.hidden && currentAlertId()) alertPlay(); }, false);
-(function(){ var a = alertAudioEl(); if (a) a.addEventListener("error", function(){ soundFileError = true; updateSoundUI(); }, false); })();
+document.addEventListener("visibilitychange", function(){ if (!document.hidden) { waResume(); if (currentAlertId()) alertPlay(); } }, false);
+(function(){ var a = alertAudioEl(); if (a) a.addEventListener("error", function(){ soundFileError = true; updateSoundUI(); }, false); waInit(); /* fetch + decode the music now, so it is ready the moment an order arrives */ })();
 
 function alertSoundStart(){
   alertPlay();
@@ -1169,17 +1279,48 @@ function renderOrderAlerts(){
     + '<div class="oalert-actions"><button class="acceptbtn" type="button" data-alert-accept="' + esc(o.id) + '">✓ Accept order</button>'
     + '<button class="viewbtn" type="button" data-alert-view="' + esc(o.id) + '">View</button></div></div>';
   wrap.querySelectorAll("[data-alert-accept]").forEach(function(b){ b.addEventListener("click", function(){ acceptAlertOrder(b.getAttribute("data-alert-accept")); }); });
-  wrap.querySelectorAll("[data-alert-view]").forEach(function(b){ b.addEventListener("click", function(){ openAdminToOrder(); }); });
+  wrap.querySelectorAll("[data-alert-view]").forEach(function(b){ b.addEventListener("click", function(){ openAdminToOrder(b.getAttribute("data-alert-view")); }); });
   wrap.querySelectorAll("[data-alert-sound]").forEach(function(b){ b.addEventListener("click", function(){ enableSound(); }); });
 }
 function acceptAlertOrder(id){
   clearOrderAlert(id); /* stop this order's sound + notification at once */
   setOrderStatus(id, "Accepted");
 }
-function openAdminToOrder(){
+/* "View" on the pop-up (and tapping the system notification): open
+   the panel ON that exact order — reset the range and clear any
+   search / status filter so the order is guaranteed to be in the
+   list, render, then scroll its card to the middle of the screen
+   and flash its border. (The old version ignored which order was
+   tapped and only re-rendered the "live" list: with the panel
+   already open nothing visibly happened at all, and with a search
+   or status filter set the order was not even in the list — so the
+   button looked completely dead.) */
+function openAdminToOrder(id){
   try { window.focus(); } catch(e){}
   if (!$("adminView").classList.contains("on")) $("openAdminBtn").click();
-  if (adminUnlocked) { adminRange = "live"; renderAdmin(); }
+  var tries = 0;
+  (function attempt(){
+    if (adminUnlocked) {
+      adminRange = "live"; adminSearch = ""; adminStatusFilter = "All";
+      renderAdmin();
+      if (id) {
+        var cards = document.querySelectorAll("[data-order-card]");
+        for (var i = 0; i < cards.length; i++) {
+          if (cards[i].getAttribute("data-order-card") === id) {
+            var card = cards[i];
+            card.scrollIntoView({ behavior: "smooth", block: "center" });
+            card.classList.add("flashcard");
+            setTimeout(function(){ card.classList.remove("flashcard"); }, 2800);
+            break;
+          }
+        }
+      }
+      return;
+    }
+    /* the panel may still be restoring the login session after
+       being opened — retry briefly instead of doing nothing */
+    if (++tries <= 12) setTimeout(attempt, 200);
+  })();
 }
 /* System notification for a new order. requireInteraction keeps it on
    screen until the owner dismisses or taps it — it never fades away by
@@ -1201,7 +1342,7 @@ function fireOrderNotification(o){
       icon: logoSrc(),
       badge: logoSrc()
     });
-    n.onclick = function(){ openAdminToOrder(); };
+    n.onclick = function(){ openAdminToOrder(o.id); };
     alertNotifs[o.id] = n;
   } catch(e){}
 }
@@ -1705,7 +1846,7 @@ function renderAdmin(){
   list.forEach(function(o){
     var linesHTML = (o.lines||[]).map(function(l){ return '<div><b>'+l.qty+' × '+esc(l.name)+'</b> — '+inr(l.qty*l.price)+'</div>'; }).join("");
     var next = NEXT_STATUS[o.status];
-    ordersHTML += '<article class="ordercard"><div class="orderhead"><div><b>'+esc(o.id)+'</b> <span style="color:var(--ink2);font-weight:700;font-size:.82rem;">• '+esc(o.table||"")+' • '+esc(o.dateLabel||"")+' '+esc(o.time||"")+'</span></div><span class="statuspill status-'+esc(o.status||"Placed")+'">'+esc(o.status||"Placed")+'</span></div>'
+    ordersHTML += '<article class="ordercard" data-order-card="'+esc(o.id)+'"><div class="orderhead"><div><b>'+esc(o.id)+'</b> <span style="color:var(--ink2);font-weight:700;font-size:.82rem;">• '+esc(o.table||"")+' • '+esc(o.dateLabel||"")+' '+esc(o.time||"")+'</span></div><span class="statuspill status-'+esc(o.status||"Placed")+'">'+esc(o.status||"Placed")+'</span></div>'
       + '<div class="orderlines">'+linesHTML+'</div>'
       + '<div class="ordermeta">Customer: <b>'+esc(o.name||"—")+'</b> &nbsp;•&nbsp; Payment: '+esc(o.pay||"—")+(o.note?' &nbsp;•&nbsp; Note: '+esc(o.note):'')+'<br/>Subtotal '+inr(o.sub||0)+' + GST '+inr(o.gst||0)+' = <b style="color:var(--ink);">'+inr(o.total||0)+'</b></div>'
       + '<div class="orderactions">'

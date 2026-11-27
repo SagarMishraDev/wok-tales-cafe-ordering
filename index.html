@@ -268,6 +268,7 @@
   .oalert-actions .acceptbtn{ flex:1; min-width:150px; background:var(--red); color:#fff; border:0; border-radius:12px; font:inherit; font-weight:800; font-size:.92rem; padding:12px; min-height:3rem; cursor:pointer; }
   .oalert-actions .acceptbtn:active{ background:var(--red-dark); }
   .oalert-actions .viewbtn{ background:var(--surface); color:var(--ink); border:1.5px solid var(--line); border-radius:12px; font:inherit; font-weight:800; font-size:.85rem; padding:12px 16px; min-height:3rem; cursor:pointer; }
+  .oalert .soundbtn{ display:block; width:100%; margin-top:10px; background:#fff7e0; color:#7a5200; border:1.5px dashed #d9a400; border-radius:12px; font:inherit; font-weight:800; font-size:.86rem; padding:11px 12px; min-height:3rem; cursor:pointer; }
   @media (prefers-reduced-motion: reduce){ .oalert-dot{ animation:none; } .oalert{ animation:none; } .oalert.noanim{ animation:none; } }
   @media (prefers-reduced-motion: reduce){
     html{ scroll-behavior:auto; }
@@ -890,25 +891,74 @@ window.addEventListener("online", function(){ retryPending(); toast("Back online
    the moment the admin taps Accept on that pop-up. If more orders are
    queued, the next pop-up appears and the music starts again for it. */
 function alertAudioEl(){ return $("orderAlertAudio"); }
+/* Sound state — tracked honestly and shown in the Owner Panel:
+   audioUnlocked: a play() has REALLY succeeded on this device, so the
+     music can start by itself when an order arrives;
+   soundBlocked: the browser refused the last play() (autoplay rule —
+     no tap on this page yet, or sound blocked for this site), so the
+     panel and the pop-up show a one-tap "Enable sound" button;
+   soundFileError: the music file itself failed to load. */
+var audioUnlocked = false;
+var soundBlocked = false;
+var soundFileError = false;
+function notePlayOutcome(p){
+  if (p && p.then) p.then(function(){
+    if (!audioUnlocked || soundBlocked) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); }
+  }, function(){
+    if (!soundBlocked) { soundBlocked = true; updateSoundUI(); }
+  });
+}
 function alertPlay(){
   try {
     var a = alertAudioEl(); if (!a) return;
     a.volume = 1;
-    if (a.paused) { var p = a.play(); if (p && p.catch) p.catch(function(){}); }
-  } catch(e){}
+    if (a.paused) notePlayOutcome(a.play());
+    else if (!audioUnlocked) { audioUnlocked = true; updateSoundUI(); }
+  } catch(e){ if (!soundBlocked) { soundBlocked = true; updateSoundUI(); } }
   try { if (navigator.vibrate) navigator.vibrate([300, 120, 300, 120, 300]); } catch(e){}
 }
 function alertPause(){
   try { var a = alertAudioEl(); if (a) { a.pause(); a.currentTime = 0; } } catch(e){}
   try { if (navigator.vibrate) navigator.vibrate(0); } catch(e){}
 }
+function soundStatusHTML(){
+  if (soundFileError) return 'Sound: <b>ERROR — music file load nahi ho payi. Page reload karke phir Enable sound dabao.</b>';
+  if (audioUnlocked && !soundBlocked) return 'Sound: <b>ON ✓ — naya order aane pe music apne aap bajegi, Accept dabane tak loop me.</b>';
+  if (soundBlocked) return 'Sound: <b>BLOCKED — browser ne awaaz rok di hai. Neeche wala 🔊 Enable sound button dabao. Phir bhi na baje to Chrome me address bar ke lock (🔒) icon → Site settings → Sound → Allow karo, aur tab pe right-click karke check karo ki “Mute site” ON to nahi hai.</b>';
+  return 'Sound: <b>abhi ON confirm nahi hua — ek baar neeche wala 🔊 Enable sound button dabao. Browser pehli tap ke baad hi kisi website ko awaaz bajane deta hai; music bajegi to samjho set ho gaya.</b>';
+}
+function updateSoundUI(){
+  var el = $("soundStatus"); if (el) el.innerHTML = soundStatusHTML();
+  renderOrderAlerts(); /* the pop-up gains / loses its Enable-sound button */
+}
+/* One-tap "Enable sound": runs inside the owner's tap, so the browser
+   must allow it. Plays the real jingle for a few seconds as proof and
+   marks the sound unlocked for future orders. */
+function enableSound(){
+  var a = alertAudioEl(); if (!a) { toast("Sound element nahi mila — page reload karo"); return; }
+  try { a.currentTime = 0; } catch(e){}
+  alertPlay();
+  if (testSoundTimer) clearTimeout(testSoundTimer);
+  testSoundTimer = setTimeout(function(){ if (!currentAlertId()) alertPause(); }, 6000);
+  setTimeout(function(){
+    var aa = alertAudioEl();
+    if (aa && !aa.paused) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); toast("✓ Sound ON ho gaya — ab naya order aate hi music apne aap bajegi"); }
+    else { soundBlocked = true; updateSoundUI(); toast("✗ Phir bhi nahi baja — Chrome me lock (🔒) icon → Site settings → Sound → Allow karo, phir ye button dobara dabao"); }
+  }, 800);
+}
 /* "Test alert sound" button: play the same jingle for a few seconds,
-   then stop it again (unless a real order pop-up is up). */
+   then stop it again (unless a real order pop-up is up) — and report
+   HONESTLY whether the music is really playing, not just requested. */
 var testSoundTimer = null;
 function beep(){
   alertPlay();
   if (testSoundTimer) clearTimeout(testSoundTimer);
   testSoundTimer = setTimeout(function(){ if (!currentAlertId()) alertPause(); }, 8000);
+  setTimeout(function(){
+    var a = alertAudioEl();
+    if (a && !a.paused) toast("✓ Sound chal raha hai — yahi music naya order aane pe Accept dabane tak loop me bajegi");
+    else { soundBlocked = true; updateSoundUI(); toast("✗ Sound nahi baja — 🔊 Enable sound dabao; phir bhi na baje to Chrome site settings me Sound = Allow karo"); }
+  }, 800);
 }
 function subscribeRealtime(){
   if (!cloudEnabled || !sbClient || realtimeChannel) return;
@@ -956,20 +1006,41 @@ var lastPopupId = null;    /* last rendered pop-up id (entrance animation once) 
 
 function currentAlertId(){ return alertQueue.length ? alertQueue[0] : null; }
 
-/* Browsers only let sound play after the owner has tapped something on
-   the page — silently prime the audio element on the first tap so the
-   music can start by itself when an order arrives later. */
-var audioPrimed = false;
-document.addEventListener("pointerdown", function(){
+/* Browsers only let a page play sound after the owner has tapped or
+   typed something on it. So the audio is unlocked on the owner's
+   interactions — and RETRIED on every interaction until a play() has
+   really succeeded. (The old code tried exactly ONCE, marked itself
+   done before knowing the result, and swallowed every later failure:
+   if that one try failed, the music stayed silent forever while the
+   notifications — which need no unlock — kept arriving.) If a pop-up
+   is already up but silent, any tap anywhere retries the music at
+   full volume inside that tap, which the browser always allows; the
+   pop-up also grows its own "Enable sound" button while blocked. */
+var unlockBusy = false;
+function tryUnlockAudio(){
+  var a = alertAudioEl(); if (!a || audioUnlocked || unlockBusy) return;
+  unlockBusy = true;
   try {
-    var a = alertAudioEl(); if (!a || audioPrimed) return;
-    audioPrimed = true;
     a.volume = 0;
     var p = a.play();
-    if (p && p.then) p.then(function(){ if (!currentAlertId()) { a.pause(); a.currentTime = 0; } a.volume = 1; }, function(){ a.volume = 1; });
-    else { a.volume = 1; }
-  } catch(e){}
-}, false);
+    if (p && p.then) p.then(function(){
+      unlockBusy = false; audioUnlocked = true; soundBlocked = false;
+      if (!currentAlertId()) { try { a.pause(); a.currentTime = 0; } catch(e){} }
+      try { a.volume = 1; } catch(e){}
+      updateSoundUI();
+      if (currentAlertId()) alertPlay();
+    }, function(){ unlockBusy = false; try { a.volume = 1; } catch(e){} });
+    else { unlockBusy = false; try { a.volume = 1; } catch(e){} }
+  } catch(e){ unlockBusy = false; }
+}
+function soundGesture(){
+  if (currentAlertId()) alertPlay(); /* pop-up up but silent: this tap retries the music */
+  else tryUnlockAudio();
+}
+document.addEventListener("pointerdown", soundGesture, false);
+document.addEventListener("keydown", soundGesture, false);
+document.addEventListener("visibilitychange", function(){ if (!document.hidden && currentAlertId()) alertPlay(); }, false);
+(function(){ var a = alertAudioEl(); if (a) a.addEventListener("error", function(){ soundFileError = true; updateSoundUI(); }, false); })();
 
 function alertSoundStart(){
   alertPlay();
@@ -1057,10 +1128,12 @@ function renderOrderAlerts(){
     + '<div class="oalert-meta">' + esc(o.id) + (o.name ? ' • ' + esc(o.name) : '') + (o.time ? ' • ' + esc(o.time) : '') + '</div>'
     + (items ? '<div class="oalert-items">' + items + '</div>' : '')
     + (more > 0 ? '<div class="oalert-more">+' + more + ' more order' + (more > 1 ? 's' : '') + ' waiting — Accept this one to see the next</div>' : '')
+    + (soundBlocked ? '<button class="soundbtn" type="button" data-alert-sound="1">🔊 Sound band hai — music chalu karne ke liye yahan tap karo</button>' : '')
     + '<div class="oalert-actions"><button class="acceptbtn" type="button" data-alert-accept="' + esc(o.id) + '">✓ Accept order</button>'
     + '<button class="viewbtn" type="button" data-alert-view="' + esc(o.id) + '">View</button></div></div>';
   wrap.querySelectorAll("[data-alert-accept]").forEach(function(b){ b.addEventListener("click", function(){ acceptAlertOrder(b.getAttribute("data-alert-accept")); }); });
   wrap.querySelectorAll("[data-alert-view]").forEach(function(b){ b.addEventListener("click", function(){ openAdminToOrder(); }); });
+  wrap.querySelectorAll("[data-alert-sound]").forEach(function(b){ b.addEventListener("click", function(){ enableSound(); }); });
 }
 function acceptAlertOrder(id){
   clearOrderAlert(id); /* stop this order's sound + notification at once */
@@ -1619,9 +1692,10 @@ function renderAdmin(){
     + '<div class="searchrow"><input id="adminSearch" type="search" placeholder="Search by order ID, name or table…" value="'+esc(adminSearch)+'" /><select id="adminStatusSel" aria-label="Filter by status">'+statusOpts+'</select>'
     + '<button class="btn" id="exportCsvBtn" type="button">⬇ Export CSV</button><button class="btn" id="refreshAdminBtn" type="button">↻ Refresh</button></div>'
     + '<div class="panelcard"><h4>Order alerts — notification + sound</h4>'
-    + '<p style="margin:0 0 8px;color:var(--ink2);font-weight:600;font-size:.86rem;line-height:1.55;">Naya order aate hi screen ke <b>neeche se ek pop-up slide karke upar aayega</b> jiske andar hi <b>Accept order</b> ka button hoga, saath me <b>notification</b> aayega jo screen pe <b>tika rahega</b>, aur <b>aapki wali music (happy cooking wali dhun) loop me bajti rahegi</b> (phone pe vibration ke saath) — pop-up ke <b>Accept button pe click karte hi music band</b> ho jayegi. Agar ek saath <b>kai orders</b> aa jayein to pop-up <b>ek-ek karke</b> aayenge: pehla accept hote hi dusra pop-up apni music ke saath aayega. Browser notification ke liye ek baar permission chahiye (neeche button se do). Panel band karke menu dekh rahe ho tab bhi pop-up dikhega; bas panel is device pe <b>unlocked</b> hona chahiye.</p>'
+    + '<p style="margin:0 0 8px;color:var(--ink2);font-weight:600;font-size:.86rem;line-height:1.55;">Naya order aate hi screen ke <b>upar se ek pop-up slide hoke neeche aayega</b> jiske andar hi <b>Accept order</b> ka button hoga, saath me <b>notification</b> aayega jo screen pe <b>tika rahega</b>, aur <b>aapki wali music (happy cooking wali dhun) loop me bajti rahegi</b> (phone pe vibration ke saath) — pop-up ke <b>Accept button pe click karte hi music band</b> ho jayegi. Agar ek saath <b>kai orders</b> aa jayein to pop-up <b>ek-ek karke</b> aayenge: pehla accept hote hi dusra pop-up apni music ke saath aayega. Browser notification ke liye ek baar permission chahiye (neeche button se do). Panel band karke menu dekh rahe ho tab bhi pop-up dikhega; bas panel is device pe <b>unlocked</b> hona chahiye.</p>'
     + '<div class="dbstatus" style="margin-top:0;">Notifications: <b>' + (notifyPermissionState() === "granted" ? "ON — naya order aane pe notification milega" : notifyPermissionState() === "denied" ? "BLOCKED — browser ke site settings me jaake is website ke liye Notifications Allow karo" : notifyPermissionState() === "unsupported" ? "Is browser me system notification nahi chalta — screen wala alert + awaaz phir bhi chalega" : "Abhi ON nahi hai — neeche wala button dabake Allow karo") + '</b></div>'
-    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;"><button class="btn teal" id="enableNotifyBtn" type="button">Enable notifications</button><button class="btn" id="testAlertBtn" type="button">Test alert sound</button></div></div>'
+    + '<div class="dbstatus" id="soundStatus" style="margin-top:8px;">' + soundStatusHTML() + '</div>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;"><button class="btn teal" id="enableNotifyBtn" type="button">Enable notifications</button><button class="btn teal" id="enableSoundBtn" type="button">🔊 Enable sound</button><button class="btn" id="testAlertBtn" type="button">Test alert sound</button></div></div>'
     + ordersHTML
     + '<div class="panelcard"><h4>Revenue — last 7 days</h4>'+daysHTML+'</div>'
     + '<div class="panelcard"><h4>Top-selling items</h4><div class="toplist">'+topsHTML+'</div><h4 style="margin-top:14px;">Orders by table</h4><div class="toplist">'+tablesHTML+'</div></div>'
@@ -1681,7 +1755,8 @@ function renderAdmin(){
   var csq=$("copySqlBtn"); if(csq) csq.addEventListener("click", function(){ if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(SQL_SCHEMA).then(function(){ toast("SQL copied — paste it in Supabase SQL Editor"); }, function(){ fallbackCopy(SQL_SCHEMA); toast("SQL copied"); }); else { fallbackCopy(SQL_SCHEMA); toast("SQL copied"); } });
   var ex=$("exportCsvBtn"); if(ex) ex.addEventListener("click", exportCSV);
   var enb=$("enableNotifyBtn"); if(enb) enb.addEventListener("click", function(){ requestNotifyPermission(function(res){ renderAdmin(); toast(res === "granted" ? "Notifications ON — naya order aane pe notification + awaaz aayegi" : res === "denied" ? "Notification blocked hai — browser settings se is site ke liye Allow karo" : res === "unsupported" ? "Is browser me notification nahi chalta — screen alert + awaaz chalega" : "Permission nahi mili — dobara try karo"); }); });
-  var tab=$("testAlertBtn"); if(tab) tab.addEventListener("click", function(){ beep(); toast("Ye wahi music hai — naya order aane pe ye pop-up ke Accept dabane tak loop me bajti rahegi"); });
+  var tab=$("testAlertBtn"); if(tab) tab.addEventListener("click", function(){ beep(); });
+  var esb=$("enableSoundBtn"); if(esb) esb.addEventListener("click", function(){ enableSound(); });
   body.querySelectorAll("[data-advance]").forEach(function(b){ b.addEventListener("click", function(){ setOrderStatus(b.getAttribute("data-advance"), NEXT_STATUS[(allOrdersSource().find(function(o){return o.id===b.getAttribute("data-advance");})||{}).status]); }); });
   body.querySelectorAll("[data-setstatus]").forEach(function(b){ b.addEventListener("click", function(){ var p=b.getAttribute("data-setstatus").split("|"); setOrderStatus(p[0], p[1]); }); });
   var rq=$("regenQrBtn"); if(rq) rq.addEventListener("click", function(){ var v=($("qrLinkInput").value||"").trim(); if(!v){ toast("Paste the published website link first"); return; } setQrLink(v); drawTableQRs(v); toast("5 table QRs generated — print each one for its own table"); });

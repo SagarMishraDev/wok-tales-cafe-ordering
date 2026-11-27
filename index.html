@@ -60,6 +60,25 @@
     border:0; background:var(--red); color:#fff; font-weight:800; font-size:.82rem; border-radius:999px;
     padding:4px 8px; min-height:2rem; appearance:none; text-align:center;
   }
+  .tablepill.locked{ background:var(--teal); border-color:var(--teal); }
+  .tablepill.locked label{ color:#fff; }
+  .tablepill .lockedval{ background:#fff; color:var(--teal); font-weight:800; font-size:.82rem; border-radius:999px; padding:5px 10px; white-space:nowrap; }
+  .tablepill .changelink{ border:0; background:transparent; color:#fff; font-size:.72rem; font-weight:700; text-decoration:underline; padding:4px 2px; min-height:2rem; }
+  .qrtablebanner{ margin:12px 14px 0; background:var(--teal); color:#fff; border-radius:14px; padding:11px 14px; display:flex; align-items:center; gap:10px; font-size:.88rem; font-weight:700; line-height:1.4; }
+  .qrtablebanner[hidden]{ display:none; }
+  .qrtablebanner b{ font-size:.95rem; }
+  .qrtablebanner .qbadge{ background:#fff; color:var(--teal); font-weight:800; border-radius:999px; padding:4px 10px; white-space:nowrap; flex:none; }
+  .lockedtable{ display:flex; align-items:center; gap:10px; background:var(--surface2); border:1.5px solid var(--teal); border-radius:12px; padding:11px 13px; font-weight:700; font-size:.94rem; }
+  .lockedtable .lt-badge{ background:var(--teal); color:#fff; font-size:.7rem; font-weight:800; letter-spacing:.04em; padding:4px 8px; border-radius:999px; white-space:nowrap; }
+  .lockedtable button{ margin-left:auto; border:0; background:transparent; color:var(--teal); font-weight:800; font-size:.8rem; text-decoration:underline; padding:6px 2px; flex:none; }
+  .qrgrid{ display:grid; grid-template-columns:1fr; gap:12px; margin-top:12px; }
+  @media(min-width:560px){ .qrgrid{ grid-template-columns:1fr 1fr; } }
+  .qrcard{ background:#fff; color:#251207; border:1.5px solid var(--line); border-radius:16px; padding:14px; text-align:center; }
+  .qrcard h5{ margin:0 0 2px; font-size:1.05rem; letter-spacing:-.01em; }
+  .qrcard .qsub{ font-size:.76rem; font-weight:700; color:#6E5546; margin-bottom:8px; line-height:1.45; word-break:break-all; }
+  .qrcard .qbox{ display:flex; justify-content:center; padding:8px; background:#fff; }
+  .qrcard .qbox img, .qrcard .qbox canvas{ max-width:100%; height:auto; }
+  .qrcard .qfoot{ font-size:.74rem; font-weight:700; color:#6E5546; margin-top:6px; line-height:1.5; }
   .iglink{
     display:inline-flex; align-items:center; justify-content:center; width:40px; height:40px; border-radius:50%;
     background:var(--surface); border:1px solid var(--line); color:var(--ink); text-decoration:none; flex:none;
@@ -364,9 +383,11 @@
     <a class="iglink" href="https://www.instagram.com/woktaless?utm_source=ig_web_button_share_sheet&hvrq=ZDNlZDc0MzIxNw==" target="_blank" rel="noopener" aria-label="Wok Tales on Instagram (@woktaless)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.5" cy="6.5" r=".8" fill="currentColor"/></svg>
     </a>
-    <div class="tablepill">
-      <label for="tableSel">Table</label>
+    <div class="tablepill" id="tablePill">
+      <label for="tableSel" id="tablePillLabel">Table</label>
       <select id="tableSel" aria-label="Your table number"></select>
+      <span class="lockedval" id="tableLockedVal" hidden></span>
+      <button class="changelink" id="tableChangeBtn" type="button" hidden>Change</button>
     </div>
   </header>
 
@@ -377,12 +398,17 @@
     <div class="htext">
       <span class="hand">Aur bataiye, kya haal hai…</span>
       <h1>Order right from your table</h1>
-      <p>One QR on every table — scan it, pick your table number, and order.</p>
+      <p id="heroSub">Each table has its own QR — scan yours and your table is selected automatically.</p>
     </div>
   </div>
 
+  <div class="qrtablebanner" id="qrTableBanner" hidden role="status">
+    <span class="qbadge" id="qrTableBadge">Table 1</span>
+    <span id="qrTableText"><b>Table set by your QR code</b> — no need to choose a table. Just pick your food and order.</span>
+  </div>
+
   <div class="howrow" aria-label="How ordering works">
-    <div class="step"><b><span class="n">1</span>Select your table</b>Choose Table 1–12 or Takeaway at the top</div>
+    <div class="step" id="howStep1"><b><span class="n">1</span><span id="howStep1Title">Scan your table QR</span></b><span id="howStep1Text">Your table (1–5) is selected automatically — nothing to choose</span></div>
     <div class="step"><b><span class="n">2</span>Pick &amp; order</b>Add items and place the order</div>
     <div class="step"><b><span class="n">3</span>Pay at the end</b>Bill includes 5% GST</div>
   </div>
@@ -569,14 +595,99 @@ function cartCount(){ var n=0; for (var k in cart) n += cart[k]; return n; }
 function cartSubtotal(){ var s=0; for (var k in cart) s += ITEMS[k].price * cart[k]; return s; }
 function gstOf(sub){ return Math.round(sub * 0.05); }
 
-/* ================= TABLE — one shared QR, customer selects table here ================= */
+/* ================= TABLE — one QR per table (Tables 1–5) =================
+   Each table gets its OWN printed QR pointing to this site with
+   ?table=N in the link, e.g. https://…/ ?table=3. When a customer scans
+   Table 3's QR, the site reads that parameter, selects Table 3
+   automatically and LOCKS it — the customer never has to choose a table
+   while ordering. Without a ?table= parameter (shared link, Takeaway,
+   typing the address by hand) the normal picker still works for
+   Tables 1–5 + Takeaway. A small "Change / Wrong table?" link unlocks
+   the picker in case someone scanned a neighbouring table's code. */
+var TABLE_COUNT = 5;
+var tableLocked = false; /* true only when the table came from a ?table= QR link and has not been unlocked */
+function parseTableParam(){
+  try {
+    var p = new URLSearchParams(window.location.search);
+    var raw = (p.get("table") || p.get("t") || "").trim();
+    if (!raw) return "";
+    var low = raw.toLowerCase().replace(/_/g, " ").trim();
+    if (low === "takeaway") return "Takeaway";
+    var digits = low.replace(/[^0-9]/g, "");
+    if (!digits) return "";
+    var n = parseInt(digits, 10);
+    if (n >= 1 && n <= TABLE_COUNT) return String(n);
+    return "";
+  } catch(e){ return ""; }
+}
+function tableLabel(v){ return v === "Takeaway" ? "Takeaway" : "Table " + v; }
+function tableLinkFor(base, n){
+  var b = String(base || "").trim();
+  if (!b) return "";
+  var hash = "";
+  var hi = b.indexOf("#");
+  if (hi !== -1) { hash = b.slice(hi); b = b.slice(0, hi); }
+  /* drop any existing table / t parameter so links never stack up */
+  b = b.replace(/([?&])(table|t)=[^&#]*/gi, "$1").replace(/[?&]$/, "").replace(/\?&/, "?");
+  var sep = b.indexOf("?") === -1 ? "?" : "&";
+  return b + sep + "table=" + encodeURIComponent(String(n)) + hash;
+}
+function applyTableUI(){
+  var sel = $("tableSel"), pill = $("tablePill"), lockedVal = $("tableLockedVal"), changeBtn = $("tableChangeBtn");
+  var banner = $("qrTableBanner"), badge = $("qrTableBadge");
+  var heroSub = $("heroSub"), s1t = $("howStep1Title"), s1x = $("howStep1Text");
+  if (tableLocked && tableNo) {
+    if (pill) pill.classList.add("locked");
+    if (sel) sel.hidden = true;
+    if (lockedVal) { lockedVal.hidden = false; lockedVal.textContent = tableLabel(tableNo); }
+    if (changeBtn) { changeBtn.hidden = false; changeBtn.textContent = "Wrong table?"; }
+    var lbl = $("tablePillLabel"); if (lbl) lbl.textContent = "Your table";
+    if (banner) banner.hidden = false;
+    if (badge) badge.textContent = tableLabel(tableNo);
+    var qt = $("qrTableText");
+    if (qt) qt.innerHTML = "<b>" + esc(tableLabel(tableNo)) + " set by your QR code</b> — no need to choose a table. Just pick your food and order.";
+    if (heroSub) heroSub.textContent = "You're at " + tableLabel(tableNo) + " — it was selected automatically from your table's QR. Just pick your food and order.";
+    if (s1t) s1t.textContent = tableLabel(tableNo) + " — done ✓";
+    if (s1x) s1x.textContent = "Set automatically by this table's QR code";
+  } else {
+    if (pill) pill.classList.remove("locked");
+    if (sel) { sel.hidden = false; sel.value = tableNo || ""; }
+    if (lockedVal) lockedVal.hidden = true;
+    if (changeBtn) changeBtn.hidden = true;
+    var lbl2 = $("tablePillLabel"); if (lbl2) lbl2.textContent = "Table";
+    if (banner) banner.hidden = true;
+    if (heroSub) heroSub.textContent = "Each table has its own QR — scan yours and your table is selected automatically. No QR? Pick Table 1–5 or Takeaway at the top.";
+    if (s1t) s1t.textContent = "Scan your table QR";
+    if (s1x) s1x.textContent = "Your table (1–5) is selected automatically — or pick it at the top";
+  }
+}
+function unlockTable(){
+  tableLocked = false;
+  applyTableUI();
+  toast("Table unlocked — pick your table at the top");
+  var sel = $("tableSel"); if (sel) { try { sel.focus(); } catch(e){} }
+}
 (function initTable(){
   var sel = $("tableSel");
   var html = '<option value="">Select table</option>';
-  for (var i=1;i<=12;i++) html += '<option value="'+i+'">Table '+i+'</option>';
+  for (var i = 1; i <= TABLE_COUNT; i++) html += '<option value="' + i + '">Table ' + i + '</option>';
   html += '<option value="Takeaway">Takeaway</option>';
   sel.innerHTML = html;
-  sel.addEventListener("change", function(){ tableNo = sel.value; toast(tableNo ? ("Ordering for " + (tableNo==="Takeaway" ? "Takeaway" : "Table " + tableNo)) : "Please select your table to order"); });
+  var fromQr = parseTableParam();
+  if (fromQr) {
+    tableNo = fromQr;
+    tableLocked = true;
+    sel.value = fromQr;
+  }
+  sel.addEventListener("change", function(){ tableNo = sel.value; toast(tableNo ? ("Ordering for " + tableLabel(tableNo)) : "Please select your table to order"); });
+  var cb = $("tableChangeBtn");
+  if (cb) cb.addEventListener("click", unlockTable);
+  applyTableUI();
+  if (fromQr) {
+    /* Confirm the auto-selection once the page has settled, so the
+       customer knows the order will go to the right table. */
+    setTimeout(function(){ toast("Welcome! You're ordering for " + tableLabel(fromQr) + " — set by your table's QR"); }, 600);
+  }
 })();
 
 /* ================= ORDER STORAGE (this device only) ================= */
@@ -886,14 +997,23 @@ function renderCartSheet(resetScroll){
   }
   var sub = cartSubtotal(), gst = gstOf(sub);
   var tableOpts = '<option value="">Select table…</option>';
-  for (var i=1;i<=12;i++) tableOpts += '<option value="'+i+'"'+(tableNo===String(i)?" selected":"")+'>Table '+i+'</option>';
+  for (var i=1;i<=TABLE_COUNT;i++) tableOpts += '<option value="'+i+'"'+(tableNo===String(i)?" selected":"")+'>Table '+i+'</option>';
   tableOpts += '<option value="Takeaway"'+(tableNo==="Takeaway"?" selected":"")+'>Takeaway</option>';
+  var tableFieldHTML;
+  if (tableLocked && tableNo) {
+    tableFieldHTML = '<div class="field"><label>Table number</label>'
+      + '<div class="lockedtable"><span>' + esc(tableLabel(tableNo)) + '</span><span class="lt-badge">SET BY QR</span>'
+      + '<button type="button" id="fTableChange">Wrong table?</button></div>'
+      + '<div class="hint">Set automatically from the QR code on your table — no need to choose. Tap “Wrong table?” only if you scanned another table\'s code.</div></div>';
+  } else {
+    tableFieldHTML = '<div class="field"><label for="fTable">Table number</label>'
+      + '<select id="fTable">' + tableOpts + '</select>'
+      + '<div class="hint">Select the table you are sitting at (Table 1–5) or Takeaway. Next time, scan your table\'s own QR and this is filled automatically.</div></div>';
+  }
   body.innerHTML =
     '<h3>Your order</h3><div class="ssub">Review your items, then place the order — the kitchen starts making it right away.</div>'
     + cartRowsHTML()
-    + '<div class="field"><label for="fTable">Table number</label>'
-    + '<select id="fTable">'+tableOpts+'</select>'
-    + '<div class="hint">Select the table you are sitting at — the same QR is on every table.</div></div>'
+    + tableFieldHTML
     + '<div class="field"><label for="fName">Your name <span style="color:var(--red-dark);">*</span></label>'
     + '<input id="fName" type="text" placeholder="e.g. Rahul" autocomplete="name" maxlength="60" required aria-required="true" />'
     + '<div class="hint">Required — the kitchen calls this name when your order is ready.</div></div>'
@@ -909,7 +1029,10 @@ function renderCartSheet(resetScroll){
     + '<div class="brow total"><span>To pay</span><span>'+inr(sub+gst)+'</span></div></div>'
     + '<button class="placebtn" id="placeBtn">Place order • '+inr(sub+gst)+'</button>';
   if (resetScroll) $("sheet").scrollTop = 0;
-  $("fTable").addEventListener("change", function(){ tableNo = this.value; $("tableSel").value = this.value; });
+  var ftSel = $("fTable");
+  if (ftSel) ftSel.addEventListener("change", function(){ tableNo = this.value; var ts = $("tableSel"); if (ts) ts.value = this.value; });
+  var ftChange = $("fTableChange");
+  if (ftChange) ftChange.addEventListener("click", function(){ unlockTable(); renderCartSheet(false); });
   $("placeBtn").addEventListener("click", placeOrder);
 }
 
@@ -936,8 +1059,8 @@ function placeOrder(){
     return;
   }
   var tableOk = tableNo === "Takeaway";
-  for (var ti = 1; ti <= 12; ti++) if (tableNo === String(ti)) tableOk = true;
-  if (!tableOk) { toast("Please select a valid table (1–12 or Takeaway)"); return; }
+  for (var ti = 1; ti <= TABLE_COUNT; ti++) if (tableNo === String(ti)) tableOk = true;
+  if (!tableOk) { toast("Please select a valid table (1–5 or Takeaway)"); return; }
   /* Customer name is REQUIRED — an order cannot be placed without it,
      so the kitchen always knows whose order it is and whom to call. */
   var nameVal = ($("fName") ? $("fName").value.trim().slice(0, 60) : "");
@@ -1244,16 +1367,16 @@ function renderAdmin(){
     + ordersHTML
     + '<div class="panelcard"><h4>Revenue — last 7 days</h4>'+daysHTML+'</div>'
     + '<div class="panelcard"><h4>Top-selling items</h4><div class="toplist">'+topsHTML+'</div><h4 style="margin-top:14px;">Orders by table</h4><div class="toplist">'+tablesHTML+'</div></div>'
-    + '<div class="panelcard"><h4>Table QR — one code for all tables</h4><p style="margin:0 0 8px;color:var(--ink2);font-weight:600;font-size:.86rem;line-height:1.55;">Make this QR <b>after publishing</b>: paste the final public link of this website below, generate the QR, print it once and put the same print on every table. Customers scan it and select their table number inside the site. If the link ever changes, generate and print a fresh QR.</p>'
-    + '<div class="field"><label for="qrLinkInput">Published website link</label><input id="qrLinkInput" type="url" placeholder="Paste the published link here, e.g. https://…" value="'+esc(savedQrLink)+'" /></div>'
-    + '<div id="qrCanvasWrap" style="margin-top:12px;"><div id="qrBox"></div></div>'
-    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;"><button class="btn teal" id="regenQrBtn" type="button">Generate QR from this link</button></div>'
-    + '<p style="font-size:.78rem;color:var(--ink2);font-weight:600;line-height:1.5;">Tip: you can also paste the same link into any free QR generator — same result. Print at least 4×4 cm so phones scan it easily. Screenshot or long-press the QR to save/print it.</p></div>'
+    + '<div class="panelcard"><h4>Table QR codes — one QR per table (Tables 1–5)</h4><p style="margin:0 0 8px;color:var(--ink2);font-weight:600;font-size:.86rem;line-height:1.55;">Har table ka <b>apna alag QR</b> hai. Paste the final public link of this website below and tap <b>Generate 5 table QRs</b> — the site adds <b>?table=1 … ?table=5</b> automatically. Print each card and put it <b>only on its own table</b>: Table 1 ka QR Table 1 pe, Table 2 ka QR Table 2 pe, and so on. Customer scans, and that table is <b>selected automatically</b> — order karte time table choose karne ki zaroorat nahi padti. If the link ever changes, generate and print fresh QRs.</p>'
+    + '<div class="field"><label for="qrLinkInput">Published website link (base link — ?table= khud jud jayega)</label><input id="qrLinkInput" type="url" placeholder="Paste the published link here, e.g. https://…" value="'+esc(savedQrLink)+'" /></div>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;"><button class="btn teal" id="regenQrBtn" type="button">Generate 5 table QRs</button><button class="btn" id="copyQrLinksBtn" type="button">Copy all 5 table links</button></div>'
+    + '<div class="qrgrid" id="qrGrid"></div>'
+    + '<p style="font-size:.78rem;color:var(--ink2);font-weight:600;line-height:1.5;">How to print: har card ko alag print karo (kam se kam 4×4 cm QR size) aur sahi table pe lagao — galat table pe galat QR lagega to order bhi galat table pe jayega. Test: Table 1 ka QR apne phone se scan karo — site khulte hi upar “Table 1 — set by QR” dikhna chahiye. Screenshot / long-press karke QR save bhi kar sakte ho.</p></div>'
     + '<div class="panelcard"><h4>Publish &amp; go live — 3 steps</h4>'
     + '<div class="toplist">'
     + '1. <b>Get the public link:</b> publish / share this page so customers can open it on any phone without a login.<br/>'
-    + '2. <b>Make the table QR:</b> paste that public link in the Table QR section above, generate the QR, print it (at least 4×4 cm) and put the same print on every table.<br/>'
-    + '3. <b>Test like a customer:</b> open the public link on another phone (or an incognito window), place a small order, and watch it appear here within a second or two.'
+    + '2. <b>Make the 5 table QRs:</b> paste that public link in the Table QR section above, generate the 5 QRs, print each one (at least 4×4 cm) and put <b>each QR only on its own table</b> — Table 1 QR on Table 1, Table 2 QR on Table 2, and so on.<br/>'
+    + '3. <b>Test like a customer:</b> scan the Table 1 QR with your phone — the site should open with Table 1 already selected — place a small order, and watch it appear here within a second or two.'
     + '</div>'
     + '<div class="notebox" style="margin-bottom:0;">Security status of this page: only the <b>publishable</b> key is in the code — the secret key is never in this website, and no admin password or verifier is in the code either: the admin login is checked by <b>Supabase Auth on the server</b>. One honest limit: anyone holding the public link + publishable key could read order names and table numbers from the database — never type anything sensitive in the order note.</div></div>'
     + '<div class="panelcard"><h4>Database (Supabase) — free live sync</h4>'
@@ -1301,8 +1424,9 @@ function renderAdmin(){
   var ex=$("exportCsvBtn"); if(ex) ex.addEventListener("click", exportCSV);
   body.querySelectorAll("[data-advance]").forEach(function(b){ b.addEventListener("click", function(){ setOrderStatus(b.getAttribute("data-advance"), NEXT_STATUS[(allOrdersSource().find(function(o){return o.id===b.getAttribute("data-advance");})||{}).status]); }); });
   body.querySelectorAll("[data-setstatus]").forEach(function(b){ b.addEventListener("click", function(){ var p=b.getAttribute("data-setstatus").split("|"); setOrderStatus(p[0], p[1]); }); });
-  var rq=$("regenQrBtn"); if(rq) rq.addEventListener("click", function(){ var v=($("qrLinkInput").value||"").trim(); if(!v){ toast("Paste the published website link first"); return; } setQrLink(v); drawQR(v); toast("QR generated — screenshot it to print"); });
-  if (savedQrLink) drawQR(savedQrLink); else { var qb=document.getElementById("qrBox"); if(qb) qb.innerHTML='<span style="color:#251207;font-weight:700;font-size:.84rem;">Paste the published link above, then tap Generate QR</span>'; }
+  var rq=$("regenQrBtn"); if(rq) rq.addEventListener("click", function(){ var v=($("qrLinkInput").value||"").trim(); if(!v){ toast("Paste the published website link first"); return; } setQrLink(v); drawTableQRs(v); toast("5 table QRs generated — print each one for its own table"); });
+  var cql=$("copyQrLinksBtn"); if(cql) cql.addEventListener("click", function(){ var v=($("qrLinkInput").value||"").trim(); if(!v){ toast("Paste the published website link first"); return; } setQrLink(v); var lines=[]; for (var qi=1; qi<=TABLE_COUNT; qi++) lines.push("Table " + qi + ": " + tableLinkFor(v, qi)); var txt=lines.join("\n"); if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(function(){ toast("All 5 table links copied"); }, function(){ fallbackCopy(txt); toast("All 5 table links copied"); }); else { fallbackCopy(txt); toast("All 5 table links copied"); } });
+  if (savedQrLink) drawTableQRs(savedQrLink); else { var qg=document.getElementById("qrGrid"); if(qg) qg.innerHTML='<div class="qrcard"><b>5 QR codes will appear here</b><div class="qfoot">Paste the published link above, then tap “Generate 5 table QRs”. Ek QR Table 1 ke liye, ek Table 2 ke liye… total 5.</div></div>'; }
   var scb=$("saveContactBtn"); if(scb) scb.addEventListener("click", function(){
     var em=(($("adminEmailEdit")||{}).value||"").trim().toLowerCase();
     var ph=(($("adminPhoneEdit")||{}).value||"").trim();
@@ -1333,11 +1457,36 @@ function renderAdmin(){
   var lk=$("lockAdminBtn"); if(lk) lk.addEventListener("click", function(){ adminUnlocked=false; adminUser=null; if (sbAuthClient && sbAuthClient.auth) sbAuthClient.auth.signOut(); renderAdmin(); toast("Panel locked — logged out"); });
   var cd=$("clearDoneBtn"); if(cd) cd.addEventListener("click", function(){ $("confirmBox").innerHTML='<div class="notebox">Remove all Completed and Cancelled orders from history on this device?<div style="margin-top:8px;display:flex;gap:8px;"><button class="btn red small" id="confirmClearBtn" type="button">Yes, clear them</button><button class="btn small" id="cancelClearBtn" type="button">Cancel</button></div></div>'; $("confirmClearBtn").addEventListener("click", function(){ saveOrders(loadOrders().filter(function(o){ return o.status!=="Completed"&&o.status!=="Cancelled"; })); toast("Old orders cleared"); renderAdmin(); }); $("cancelClearBtn").addEventListener("click", renderAdmin); });
 }
-function drawQR(link){
-  var box=document.getElementById("qrBox"); if(!box) return; box.innerHTML="";
-  if(!link){ box.textContent="Paste the published link first"; return; }
-  try{ if(window.QRCode){ new QRCode(box,{text:link,width:180,height:180,correctLevel:QRCode.CorrectLevel.M}); } else { box.innerHTML='<span style="color:#251207;font-weight:700;font-size:.84rem;">QR library loading… tap Regenerate QR</span>'; } }catch(e){ box.textContent="Could not draw QR — copy the link and use any QR generator."; }
+function drawQRInto(el, link, size){
+  if (!el) return;
+  el.innerHTML = "";
+  if (!link) { el.textContent = "Paste the published link first"; return; }
+  try {
+    if (window.QRCode) { new QRCode(el, { text: link, width: size || 168, height: size || 168, correctLevel: QRCode.CorrectLevel.M }); }
+    else { el.innerHTML = '<span style="color:#251207;font-weight:700;font-size:.84rem;">QR library loading… tap Generate again</span>'; }
+  } catch(e){ el.textContent = "Could not draw QR — use the link below in any QR generator."; }
 }
+/* Build the 5 per-table QR cards. Each card's QR points at the base
+   link + ?table=N, so scanning it auto-selects that table. */
+function drawTableQRs(baseLink){
+  var grid = document.getElementById("qrGrid");
+  if (!grid) return;
+  var base = String(baseLink || "").trim();
+  if (!base) { grid.innerHTML = '<div class="qrcard"><b>Paste the published link first</b><div class="qfoot">Upar published website link paste karke “Generate 5 table QRs” dabao.</div></div>'; return; }
+  var html = "";
+  for (var n = 1; n <= TABLE_COUNT; n++) {
+    var link = tableLinkFor(base, n);
+    html += '<div class="qrcard"><h5>TABLE ' + n + '</h5>'
+      + '<div style="font-weight:800;font-size:.82rem;color:#D92323;letter-spacing:.03em;">WOK TALES — SCAN &amp; ORDER</div>'
+      + '<div class="qbox" id="qrBox-' + n + '"></div>'
+      + '<div class="qsub">' + esc(link) + '</div>'
+      + '<div class="qfoot">Is QR ko <b>sirf Table ' + n + '</b> pe lagao.<br/>Scan karte hi Table ' + n + ' automatic select ho jayega — customer ko table choose nahi karna padega.</div></div>';
+  }
+  grid.innerHTML = html;
+  for (var m = 1; m <= TABLE_COUNT; m++) drawQRInto(document.getElementById("qrBox-" + m), tableLinkFor(base, m), 168);
+}
+/* Kept for compatibility — older code paths called drawQR(link). */
+function drawQR(link){ drawTableQRs(link); }
 function tryAdminLogin(){
   var errEl = $("adminPassErr");
   function fail(msg){ if (errEl) errEl.textContent = msg; }

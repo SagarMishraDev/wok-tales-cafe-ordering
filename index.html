@@ -904,16 +904,23 @@ var soundFileError = false;
 function notePlayOutcome(p){
   if (p && p.then) p.then(function(){
     if (!audioUnlocked || soundBlocked) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); }
-  }, function(){
+  }, function(err){
+    /* AbortError only means a pause() interrupted this play() (the
+       unlock probe, a test timer, an Accept tap) — the browser did
+       NOT block the sound. The old code treated EVERY rejection as a
+       block, so one interrupted play latched "Sound: BLOCKED" on the
+       panel even with every Chrome toggle ON, and nothing cleared it. */
+    if (err && err.name === "AbortError") return;
     if (!soundBlocked) { soundBlocked = true; updateSoundUI(); }
   });
 }
 function alertPlay(){
   try {
     var a = alertAudioEl(); if (!a) return;
+    try { a.muted = false; } catch(e){}
     a.volume = 1;
     if (a.paused) notePlayOutcome(a.play());
-    else if (!audioUnlocked) { audioUnlocked = true; updateSoundUI(); }
+    else if (!audioUnlocked || soundBlocked) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); }
   } catch(e){ if (!soundBlocked) { soundBlocked = true; updateSoundUI(); } }
   try { if (navigator.vibrate) navigator.vibrate([300, 120, 300, 120, 300]); } catch(e){}
 }
@@ -931,34 +938,46 @@ function updateSoundUI(){
   var el = $("soundStatus"); if (el) el.innerHTML = soundStatusHTML();
   renderOrderAlerts(); /* the pop-up gains / loses its Enable-sound button */
 }
+/* Who wants the music right now? A live order pop-up, or a manual
+   Enable/Test playback that has not finished yet. The unlock probe
+   and the test timers may only pause the music when NOBODY wants it.
+   (The old probe paused the element whenever no pop-up was up, which
+   killed the Enable/Test playback started by the very same tap: the
+   panel then verified "paused", latched BLOCKED and showed the ✗
+   toast — with every Chrome setting already ON.) */
+var soundTestUntil = 0;
+function soundWanted(){ return !!currentAlertId() || Date.now() < soundTestUntil; }
+function maybeStopSound(){ if (!soundWanted()) alertPause(); }
 /* One-tap "Enable sound": runs inside the owner's tap, so the browser
    must allow it. Plays the real jingle for a few seconds as proof and
    marks the sound unlocked for future orders. */
 function enableSound(){
   var a = alertAudioEl(); if (!a) { toast("Sound element nahi mila — page reload karo"); return; }
+  soundTestUntil = Date.now() + 6000; /* this tap's playback is wanted for 6s */
   try { a.currentTime = 0; } catch(e){}
   alertPlay();
   if (testSoundTimer) clearTimeout(testSoundTimer);
-  testSoundTimer = setTimeout(function(){ if (!currentAlertId()) alertPause(); }, 6000);
+  testSoundTimer = setTimeout(maybeStopSound, 6100);
   setTimeout(function(){
     var aa = alertAudioEl();
-    if (aa && !aa.paused) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); toast("✓ Sound ON ho gaya — ab naya order aate hi music apne aap bajegi"); }
+    if (aa && !aa.paused && aa.readyState >= 2) { audioUnlocked = true; soundBlocked = false; updateSoundUI(); toast("✓ Sound ON ho gaya — ab naya order aate hi music apne aap bajegi"); }
     else { soundBlocked = true; updateSoundUI(); toast("✗ Phir bhi nahi baja — Chrome me lock (🔒) icon → Site settings → Sound → Allow karo, phir ye button dobara dabao"); }
-  }, 800);
+  }, 900);
 }
 /* "Test alert sound" button: play the same jingle for a few seconds,
    then stop it again (unless a real order pop-up is up) — and report
    HONESTLY whether the music is really playing, not just requested. */
 var testSoundTimer = null;
 function beep(){
+  soundTestUntil = Date.now() + 8000; /* this tap's playback is wanted for 8s */
   alertPlay();
   if (testSoundTimer) clearTimeout(testSoundTimer);
-  testSoundTimer = setTimeout(function(){ if (!currentAlertId()) alertPause(); }, 8000);
+  testSoundTimer = setTimeout(maybeStopSound, 8100);
   setTimeout(function(){
     var a = alertAudioEl();
-    if (a && !a.paused) toast("✓ Sound chal raha hai — yahi music naya order aane pe Accept dabane tak loop me bajegi");
+    if (a && !a.paused && a.readyState >= 2) toast("✓ Sound chal raha hai — yahi music naya order aane pe Accept dabane tak loop me bajegi");
     else { soundBlocked = true; updateSoundUI(); toast("✗ Sound nahi baja — 🔊 Enable sound dabao; phir bhi na baje to Chrome site settings me Sound = Allow karo"); }
-  }, 800);
+  }, 900);
 }
 function subscribeRealtime(){
   if (!cloudEnabled || !sbClient || realtimeChannel) return;
@@ -1007,31 +1026,49 @@ var lastPopupId = null;    /* last rendered pop-up id (entrance animation once) 
 function currentAlertId(){ return alertQueue.length ? alertQueue[0] : null; }
 
 /* Browsers only let a page play sound after the owner has tapped or
-   typed something on it. So the audio is unlocked on the owner's
-   interactions — and RETRIED on every interaction until a play() has
-   really succeeded. (The old code tried exactly ONCE, marked itself
-   done before knowing the result, and swallowed every later failure:
-   if that one try failed, the music stayed silent forever while the
-   notifications — which need no unlock — kept arriving.) If a pop-up
-   is already up but silent, any tap anywhere retries the music at
-   full volume inside that tap, which the browser always allows; the
-   pop-up also grows its own "Enable sound" button while blocked. */
+   typed something on it IN THIS TAB — clicks on Chrome's own panels
+   (the lock-icon site panel, settings pages) do NOT count, and a
+   restored login session has had no tap at all. That is why an order
+   can arrive with every Chrome toggle ON and the first automatic
+   play() is still refused: the panel then honestly shows BLOCKED.
+   So the audio is probed on the owner's interactions — and RETRIED
+   on every interaction until sound is confirmed working (the old
+   guard stopped retrying once a probe had succeeded, even if a
+   later state had latched BLOCKED again). If a pop-up is already up
+   but silent, any tap anywhere retries the music at full volume
+   inside that tap, which the browser always allows; the pop-up also
+   grows its own "Enable sound" button while sound is unconfirmed. */
 var unlockBusy = false;
 function tryUnlockAudio(){
-  var a = alertAudioEl(); if (!a || audioUnlocked || unlockBusy) return;
+  var a = alertAudioEl(); if (!a || unlockBusy) return;
+  if (audioUnlocked && !soundBlocked) return; /* confirmed working — nothing to do */
   unlockBusy = true;
   try {
-    a.volume = 0;
+    /* Silent probe: a MUTED play() is always allowed, and running it
+       inside the owner's tap is what makes this tab "activated", so
+       later order-arrival play() calls are legal. The probe must
+       NEVER pause playback somebody else wants: the old probe
+       paused the element in its success handler whenever no pop-up
+       was up, which killed the Enable/Test playback started by the
+       very same tap — the owner heard nothing, the verification saw
+       a paused element, and BLOCKED latched with all toggles ON. */
+    var wasPaused = a.paused;
+    try { a.muted = true; } catch(e){}
     var p = a.play();
     if (p && p.then) p.then(function(){
-      unlockBusy = false; audioUnlocked = true; soundBlocked = false;
-      if (!currentAlertId()) { try { a.pause(); a.currentTime = 0; } catch(e){} }
-      try { a.volume = 1; } catch(e){}
+      unlockBusy = false;
+      audioUnlocked = true; soundBlocked = false;
+      if (soundWanted()) { try { a.muted = false; a.volume = 1; } catch(e){} }
+      else if (wasPaused) { try { a.pause(); a.currentTime = 0; a.muted = false; } catch(e){} }
+      else { try { a.muted = false; } catch(e){} }
       updateSoundUI();
-      if (currentAlertId()) alertPlay();
-    }, function(){ unlockBusy = false; try { a.volume = 1; } catch(e){} });
-    else { unlockBusy = false; try { a.volume = 1; } catch(e){} }
-  } catch(e){ unlockBusy = false; }
+    }, function(err){
+      unlockBusy = false;
+      try { a.muted = false; } catch(e){}
+      if (err && err.name !== "AbortError" && !soundBlocked) { soundBlocked = true; updateSoundUI(); }
+    });
+    else { unlockBusy = false; try { a.muted = false; } catch(e){} }
+  } catch(e){ unlockBusy = false; try { var aa = alertAudioEl(); if (aa) aa.muted = false; } catch(e2){} }
 }
 function soundGesture(){
   if (currentAlertId()) alertPlay(); /* pop-up up but silent: this tap retries the music */
@@ -1128,7 +1165,7 @@ function renderOrderAlerts(){
     + '<div class="oalert-meta">' + esc(o.id) + (o.name ? ' • ' + esc(o.name) : '') + (o.time ? ' • ' + esc(o.time) : '') + '</div>'
     + (items ? '<div class="oalert-items">' + items + '</div>' : '')
     + (more > 0 ? '<div class="oalert-more">+' + more + ' more order' + (more > 1 ? 's' : '') + ' waiting — Accept this one to see the next</div>' : '')
-    + (soundBlocked ? '<button class="soundbtn" type="button" data-alert-sound="1">🔊 Sound band hai — music chalu karne ke liye yahan tap karo</button>' : '')
+    + ((soundBlocked || !audioUnlocked) ? '<button class="soundbtn" type="button" data-alert-sound="1">🔊 Sound band hai — music chalu karne ke liye yahan tap karo</button>' : '')
     + '<div class="oalert-actions"><button class="acceptbtn" type="button" data-alert-accept="' + esc(o.id) + '">✓ Accept order</button>'
     + '<button class="viewbtn" type="button" data-alert-view="' + esc(o.id) + '">View</button></div></div>';
   wrap.querySelectorAll("[data-alert-accept]").forEach(function(b){ b.addEventListener("click", function(){ acceptAlertOrder(b.getAttribute("data-alert-accept")); }); });

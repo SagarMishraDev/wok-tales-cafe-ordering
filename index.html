@@ -885,15 +885,58 @@ function rowToOrder(r){
    own tracking — they use fetchOwnOrderStatuses() below, which asks
    only for the status of this phone's own order ids. */
 function ordersReadClient(){ return (adminUnlocked && sbAuthClient) ? sbAuthClient : sbClient; }
+/* WHY THIS FETCH IS BUILT DEFENSIVELY (the "orders kabhi dikhte hain,
+   kabhi gayab" bug): with the privacy-upgrade SQL applied, the anon
+   role has NO select policy on the orders table — and PostgREST
+   answers a read it may not see with HTTP 200 and an EMPTY list, not
+   an error. Any fetch that happened to run before the owner session
+   was fully ready (panel reopened, token still refreshing, realtime
+   resubscribe) therefore "succeeded" with zero rows, and the old code
+   assigned that empty list straight over the good one — Today, Week,
+   Month, History, the stats and the 7-day chart ALL went to 0 until
+   some later lucky fetch filled it again. So now:
+   1) a successful read MERGES into the cached list by order id (the
+      fresh row wins) — a read can add or update orders, never make
+      known orders disappear;
+   2) an error, or a suspicious EMPTY success while this device
+      already knows orders exist, is retried ONCE through the other
+      client (signed-in session <-> anon), so a token-timing hiccup
+      on one path cannot blank the panel either. */
 function fetchCloudOrders(cb){
   if (!cloudEnabled || !sbClient) { if (cb) cb(false); return; }
-  ordersReadClient().from("orders").select("*").order("created_at", { ascending:false }).limit(500)
-    .then(function(res){
-      if (res.error) { setSyncChip("error", "Sync error"); if (cb) cb(false); return; }
-      cloudOrders = (res.data || []).map(rowToOrder);
-      setSyncChip("live", "Live sync ON");
-      if (cb) cb(true);
-    }, function(){ setSyncChip("error", "Sync error"); if (cb) cb(false); });
+  var primary = ordersReadClient();
+  var secondary = (primary === sbAuthClient) ? sbClient : sbAuthClient;
+  function accept(rows){
+    var fresh = (rows || []).map(rowToOrder);
+    if (cloudOrders && cloudOrders.length){
+      var seen = {}; fresh.forEach(function(o){ seen[o.id] = 1; });
+      var merged = fresh.slice();
+      cloudOrders.forEach(function(o){ if (!seen[o.id]) merged.push(o); });
+      merged.sort(function(a, b){ return (b.ts || 0) - (a.ts || 0); });
+      cloudOrders = merged;
+    } else {
+      cloudOrders = fresh;
+    }
+    setSyncChip("live", "Live sync ON");
+    if (cb) cb(true);
+  }
+  function attempt(client, isRetry){
+    if (!client) { setSyncChip("error", "Sync error"); if (cb) cb(false); return; }
+    client.from("orders").select("*").order("created_at", { ascending:false }).limit(500)
+      .then(function(res){
+        if (res.error){
+          if (!isRetry && secondary){ attempt(secondary, true); return; }
+          setSyncChip("error", "Sync error"); if (cb) cb(false); return;
+        }
+        var rows = res.data || [];
+        if (!rows.length && !isRetry && secondary && ((cloudOrders && cloudOrders.length) || loadOrders().length)){ attempt(secondary, true); return; }
+        accept(rows);
+      }, function(){
+        if (!isRetry && secondary){ attempt(secondary, true); return; }
+        setSyncChip("error", "Sync error"); if (cb) cb(false);
+      });
+  }
+  attempt(primary, false);
 }
 function insertCloudOrder(o, cb){
   if (!cloudEnabled || !sbClient) { cb(false, "not configured"); return; }
@@ -1889,7 +1932,23 @@ var STATUSES = ["Placed","Accepted","Preparing","Ready","Completed","Cancelled"]
 var NEXT_STATUS = { "Placed":"Accepted", "Accepted":"Preparing", "Preparing":"Ready", "Ready":"Completed" };
 
 function startOfDay(d){ var x=new Date(d); x.setHours(0,0,0,0); return x.getTime(); }
-function allOrdersSource(){ return (cloudEnabled && cloudOrders) ? cloudOrders : loadOrders(); }
+/* The panel's order list is the UNION of the cloud list and this
+   device's own saved orders, deduped by order id (the cloud copy
+   wins — it carries the freshest status). One source hiccuping can
+   therefore never hide orders the other source knows about: past
+   orders stay visible in Today / Week / Month / All-History at all
+   times. (Live view still filters to today's active orders only,
+   exactly as before.) */
+function allOrdersSource(){
+  var local = loadOrders();
+  if (!(cloudEnabled && cloudOrders) || !cloudOrders.length) return local.length ? local : (cloudOrders || local);
+  if (!local.length) return cloudOrders;
+  var seen = {}; var out = [];
+  cloudOrders.forEach(function(o){ seen[o.id] = 1; out.push(o); });
+  local.forEach(function(o){ if (o.id && !seen[o.id]) out.push(o); });
+  out.sort(function(a, b){ return (b.ts || 0) - (a.ts || 0); });
+  return out;
+}
 function filteredOrders(){
   var all = allOrdersSource();
   var now = new Date(); var todayStart = startOfDay(now);

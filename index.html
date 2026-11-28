@@ -801,17 +801,19 @@ function initSupabase(){
   if (!cfg.url || !cfg.key) { setSyncChip("local", "Local only"); return false; }
   if (!window.supabase || !window.supabase.createClient) { setSyncChip("error", "Sync error"); return false; }
   try {
-    /* CRITICAL — why TWO clients: the orders table's RLS policies grant
-       read / insert / status-update to the "anon" role only. The moment
-       the admin signs in on the SAME client, Supabase switches that
-       client's role from "anon" to "authenticated", no policy matches,
-       and every orders SELECT silently returns ZERO rows (no error) —
-       the Owner Panel then shows "Orders 0 / No orders in this view yet"
-       even though the orders are in the database and Live Sync says ON.
-       So the orders-data client NEVER signs in (persistSession off, its
-       own storage key, it cannot pick up a saved login), and admin auth
-       lives on its own separate client. Data requests always go out as
-       anon, exactly like a customer's phone, logged in or not. */
+    /* CRITICAL — why TWO clients: customer phones must place orders
+       and check their own order's status as the "anon" role, while
+       the Owner Panel reads / updates orders through the signed-in
+       "authenticated" session — the privacy RLS grants SELECT and
+       status-UPDATE to authenticated ONLY, and an anon read of the
+       orders table silently returns ZERO rows (HTTP 200, no error).
+       So: sbClient NEVER signs in (persistSession off, its own
+       storage key) and carries all customer traffic; sbAuthClient
+       owns the admin login, and every panel read, status update and
+       the panel's realtime channel go through it — with the session
+       verified before each use (see ensureAdminSession below),
+       because a panel read that slips out without a valid session
+       comes back as a blind empty list that looks like success. */
     sbClient = window.supabase.createClient(cfg.url, cfg.key, { auth:{ persistSession:false, autoRefreshToken:false, detectSessionInUrl:false, storageKey:"wt-orders-anon-v1" } });
     sbAuthClient = window.supabase.createClient(cfg.url, cfg.key, { auth:{ persistSession:true, autoRefreshToken:true, detectSessionInUrl:false, storageKey:"wt-admin-auth-v1" } });
     watchAuthChanges();
@@ -966,30 +968,98 @@ function handleSessionExpired(){
   if ($("adminView") && $("adminView").classList.contains("on")) renderAdmin();
   toast("Login session expire ho gaya — Owner Panel me dobara login karo, warna naye orders nahi dikhenge aur purane status stale rahenge");
 }
-/* WHY THIS FETCH IS BUILT DEFENSIVELY (the "orders kabhi dikhte hain,
-   kabhi gayab" bug): with the privacy-upgrade SQL applied, the anon
-   role has NO select policy on the orders table — and PostgREST
-   answers a read it may not see with HTTP 200 and an EMPTY list, not
-   an error. Any fetch that happened to run before the owner session
-   was fully ready (panel reopened, token still refreshing, realtime
-   resubscribe) therefore "succeeded" with zero rows, and the old code
-   assigned that empty list straight over the good one — Today, Week,
-   Month, History, the stats and the 7-day chart ALL went to 0 until
-   some later lucky fetch filled it again. So now:
-   1) a successful read MERGES into the cached list by order id (the
-      fresh row wins) — a read can add or update orders, never make
-      known orders disappear;
-   2) an error, or a suspicious EMPTY success while this device
-      already knows orders exist, is retried ONCE through the other
-      client (signed-in session <-> anon), so a token-timing hiccup
-      on one path cannot blank the panel either. */
+/* ================= READ PATH — VERIFY THE SESSION BEFORE EVERY READ =================
+   ROOT CAUSE of the recurring "dusre panel pe order accept nahi
+   dikha / notification baar-baar aata raha / panel pe koi order
+   show hi nahi hua" reports — pinned down by a live two-tab test:
+   an order accepted in panel tab 1 was STILL "Placed", Accept
+   button and all, in panel tab 2 after 40 seconds, 15s poll
+   included. The session-heal-on-error fix did not cure it, because
+   the failure is not an error:
+   - With the privacy RLS applied, the anon role has NO select
+     policy on orders, and PostgREST answers a read it may not see
+     with HTTP 200 and ZERO rows — no error object at all.
+   - A panel tab sits open all day. Its access token expires; and
+     because every tab of the same browser shares ONE stored
+     session, a token refresh in tab 1 rotates the refresh token
+     and can strand tab 2's client holding a stale one. From then
+     on, tab 2's "signed-in" reads either fail in ways that are not
+     recognisable auth errors, or its requests effectively go out
+     without a usable session — and the old code's fallback was the
+     ANON client, whose blind empty list counted as SUCCESS.
+   - accept() then merged that empty list into the cache, faithfully
+     preserving the last-seen "Placed" row forever: no poll and no
+     realtime event could ever correct the status, the pop-up kept
+     its Accept button, and the 25s reminder timer kept re-firing
+     the laptop notification. Realtime died the same silent death —
+     RLS filters its events with the same stale token, yet the
+     channel still reports SUBSCRIBED, so nothing resubscribed.
+   - The heal path never fired: a blind read is not an error, it
+     looks exactly like success.
+   On the "panel 2 jagah login hai, isliye to nahi?" question:
+   Supabase Auth happily allows the same admin signed in on many
+   devices at once — each device holds its OWN independent session,
+   and one device's login never blocks another's reads. Multi-login
+   by itself is NOT the cause. The cause is one long-open tab
+   reading with a stale token and the code believing the empty
+   answer that came back.
+   THE FIX: no full-table read goes out on trust any more. While
+   the panel is unlocked, fetchCloudOrders() FIRST runs
+   ensureAdminSession() — getSession() re-reads the session from
+   storage (picking up a token another tab refreshed) and refreshes
+   it when it has expired — and only then reads, through the
+   signed-in client ONLY: the one client whose role the RLS SELECT
+   policy actually grants. The anon client is never a fallback for
+   the full read while unlocked. If no valid session can be
+   produced, the fetch reports failure (Sync error chip, cache left
+   untouched) instead of a fake success; if the login is
+   definitively dead (the server rejected the refresh token), the
+   panel drops to the login screen rather than masquerading as
+   live over stale data. healAdminSession() above stays as a second
+   layer for a token that dies between the check and the request. */
+var sessionCheckInFlight = null; /* concurrent fetches share ONE session check */
+function ensureAdminSession(cb){
+  if (!adminUnlocked || !sbAuthClient || !sbAuthClient.auth) { cb(true, false); return; }
+  if (sessionCheckInFlight) { sessionCheckInFlight.push(cb); return; }
+  sessionCheckInFlight = [cb];
+  function done(ok, dead){
+    var cbs = sessionCheckInFlight; sessionCheckInFlight = null;
+    cbs.forEach(function(f){ try { f(ok, dead); } catch(e){} });
+  }
+  function tryRefresh(){
+    try {
+      sbAuthClient.auth.refreshSession().then(function(r){
+        var s = r && r.data ? r.data.session : null;
+        if (s) { adminUser = s.user; done(true, false); return; }
+        /* Refresh produced nothing. The login is DEAD only when the
+           server actually rejected the refresh token (a 4xx auth
+           error). A network-level failure proves nothing — report
+           "not ok, not dead" and let the next poll try again,
+           instead of throwing the owner out on a Wi-Fi blip. */
+        var err = r && r.error ? r.error : null;
+        var dead = !!(err && (err.status === 400 || err.status === 401 || err.status === 403));
+        done(false, dead);
+      }, function(){ done(false, false); });
+    } catch(e){ done(false, false); }
+  }
+  try {
+    sbAuthClient.auth.getSession().then(function(r){
+      var s = r && r.data ? r.data.session : null;
+      if (s) { adminUser = s.user; done(true, false); return; }
+      tryRefresh();
+    }, tryRefresh);
+  } catch(e){ tryRefresh(); }
+}
 function fetchCloudOrders(cb){
   if (!cloudEnabled || !sbClient) { if (cb) cb(false); return; }
-  var primary = ordersReadClient();
-  var secondary = (primary === sbAuthClient) ? sbClient : sbAuthClient;
   var healed = false; /* one session-refresh + retry per fetch, never a loop */
-  function accept(rows, viaClient){
+  function accept(rows){
     var fresh = (rows || []).map(rowToOrder);
+    /* A successful read MERGES into the cached list by order id
+       (the fresh row wins): a read can add or update orders, never
+       make known orders disappear. This merge is what fixed the
+       older "orders kabhi dikhte hain, kabhi gayab" bug — an empty
+       or partial read must never wipe Today / Week / History. */
     if (cloudOrders && cloudOrders.length){
       var seen = {}; fresh.forEach(function(o){ seen[o.id] = 1; });
       var merged = fresh.slice();
@@ -999,15 +1069,13 @@ function fetchCloudOrders(cb){
     } else {
       cloudOrders = fresh;
     }
-    /* An EMPTY answer from the ANON client while the panel is
-       unlocked is not proof of "no orders": after the privacy SQL
-       the anon role cannot read the table at all, so empty there
-       means "this read was blind". Only claim Live when the read
-       could actually see the table (signed-in client, or it
-       returned rows) — otherwise show the error state honestly so
-       a stale panel never masquerades as a live one. */
-    var blindEmpty = adminUnlocked && viaClient !== sbAuthClient && !fresh.length && ((cloudOrders && cloudOrders.length) || loadOrders().length);
-    setSyncChip(blindEmpty ? "error" : "live", blindEmpty ? "Sync error" : "Live sync ON");
+    /* A verified signed-in read that STILL returns zero rows while
+       this device knows orders exist is not believed as "the table
+       is empty" — a half-applied RLS policy answers exactly like
+       that. The cache above survives either way; the chip shows the
+       error state instead of claiming Live over unseen data. */
+    var suspiciousEmpty = adminUnlocked && !fresh.length && ((cloudOrders && cloudOrders.length) || loadOrders().length);
+    setSyncChip(suspiciousEmpty ? "error" : "live", suspiciousEmpty ? "Sync error" : "Live sync ON");
     if (cb) cb(true);
   }
   function attempt(client, isRetry){
@@ -1015,33 +1083,51 @@ function fetchCloudOrders(cb){
     client.from("orders").select("*").order("created_at", { ascending:false }).limit(500)
       .then(function(res){
         if (res.error){
-          /* Dead-session repair comes BEFORE the anon fallback: an
-             auth error from the signed-in client means this device's
-             login died (long-open tab, laptop sleep, token revoked).
-             Refresh once and retry the SAME client — falling back to
-             anon first would just "succeed" with a blind empty list
-             and cement the stale state. If no session can be
-             recovered at all, say so honestly via the login screen. */
+          /* An auth error from the signed-in client means the token
+             died between the pre-read check and this request: heal
+             once and retry the SAME client. There is deliberately
+             NO fallback to the anon client while unlocked — under
+             the privacy RLS its "success" is a blind empty list,
+             which is exactly how stale statuses used to cement
+             themselves into the cache. */
           if (client === sbAuthClient && adminUnlocked && !healed && isAuthError(res.error)){
             healed = true;
             healAdminSession(function(ok){
-              if (ok) { resubscribeRealtime(); attempt(sbAuthClient, isRetry); }
-              else { handleSessionExpired(); if (!isRetry && secondary) attempt(secondary, true); else if (cb) cb(false); }
+              if (ok) { resubscribeRealtime(); attempt(sbAuthClient, true); }
+              else { handleSessionExpired(); if (cb) cb(false); }
             });
             return;
           }
-          if (!isRetry && secondary){ attempt(secondary, true); return; }
           setSyncChip("error", "Sync error"); if (cb) cb(false); return;
         }
         var rows = res.data || [];
-        if (!rows.length && !isRetry && secondary && ((cloudOrders && cloudOrders.length) || loadOrders().length)){ attempt(secondary, true); return; }
-        accept(rows, client);
+        if (!rows.length && adminUnlocked && !isRetry && ((cloudOrders && cloudOrders.length) || loadOrders().length)){
+          /* Session verified moments ago, yet the answer looks
+             blind: refresh once explicitly and read once more
+             before accepting it. */
+          healed = true;
+          healAdminSession(function(ok){ if (ok) attempt(client, true); else accept(rows); });
+          return;
+        }
+        accept(rows);
       }, function(){
-        if (!isRetry && secondary){ attempt(secondary, true); return; }
         setSyncChip("error", "Sync error"); if (cb) cb(false);
       });
   }
-  attempt(primary, false);
+  if (adminUnlocked) {
+    /* Verify (and if needed refresh) the admin session FIRST, then
+       read through the signed-in client ONLY — the one client whose
+       role the RLS SELECT policy actually grants. No valid session
+       → no read and no fake success: the failure is reported, the
+       cache is left untouched, and a definitively dead login drops
+       the panel to the login screen. */
+    ensureAdminSession(function(ok, dead){
+      if (!ok) { setSyncChip("error", "Sync error"); if (dead) handleSessionExpired(); if (cb) cb(false); return; }
+      attempt(sbAuthClient, false);
+    });
+    return;
+  }
+  attempt(sbClient, false);
 }
 function insertCloudOrder(o, cb){
   if (!cloudEnabled || !sbClient) { cb(false, "not configured"); return; }
@@ -1056,21 +1142,29 @@ function updateCloudStatus(id, status, cb){
   function send(){
     return ordersReadClient().from("orders").update({ status:status }).eq("id", id);
   }
-  send().then(function(res){
-    /* If this device's login died, the update never reached the
-       database — the order would stay "Placed" for every other
-       device and keep alerting there. Heal the session once and
-       send the status again before reporting failure. */
-    if (res.error && adminUnlocked && isAuthError(res.error)){
-      healAdminSession(function(ok){
-        if (!ok) { handleSessionExpired(); cb(false); return; }
-        resubscribeRealtime();
-        send().then(function(r2){ cb(!r2.error); }, function(){ cb(false); });
-      });
-      return;
-    }
-    cb(!res.error);
-  }, function(){ cb(false); });
+  function go(){
+    send().then(function(res){
+      /* If this device's login died, the update never reached the
+         database — the order would stay "Placed" for every other
+         device and keep alerting there. Heal the session once and
+         send the status again before reporting failure. */
+      if (res.error && adminUnlocked && isAuthError(res.error)){
+        healAdminSession(function(ok){
+          if (!ok) { handleSessionExpired(); cb(false); return; }
+          resubscribeRealtime();
+          send().then(function(r2){ cb(!r2.error); }, function(){ cb(false); });
+        });
+        return;
+      }
+      cb(!res.error);
+    }, function(){ cb(false); });
+  }
+  /* Same rule as the read path: verify the session BEFORE the
+     write, so an Accept tapped in a long-open tab really reaches
+     the database (and therefore every other panel) instead of
+     silently dying with a stale token. */
+  if (adminUnlocked) ensureAdminSession(function(ok, dead){ if (!ok) { if (dead) handleSessionExpired(); cb(false); return; } go(); });
+  else go();
 }
 /* Customer-side status lookup: returns ONLY {id, status} for the
    orders placed on THIS phone — never the full orders table, never
@@ -1360,13 +1454,13 @@ function subscribeRealtime(){
       });
     realtimeChannel = ch;
     ch.subscribe(function(status){
-      /* A socket that errored or timed out (laptop sleep, Wi-Fi
-         drop, long background tab) used to stay dead forever — the
-         panel then depended on luck. Resubscribe it. Only react
-         while this channel is still the current one, so an
+      /* A socket that errored, timed out or closed (laptop sleep,
+         Wi-Fi drop, long background tab) used to stay dead forever
+         — the panel then depended on luck. Resubscribe it. Only
+         react while this channel is still the current one, so an
          intentional resubscribe never loops. */
       if (realtimeChannel !== ch) return;
-      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") scheduleResubscribe();
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") scheduleResubscribe();
     });
   } catch(e){}
 }
@@ -2434,6 +2528,13 @@ if (initSupabase()) { fetchOwnOrderStatuses(function(){ refreshCustomerTracking(
 function ordersSignature(list){ return (list || []).map(function(o){ return o.id + ":" + (o.status || ""); }).join("|"); }
 function pollTick(){
   if (!cloudEnabled || !sbClient) return;
+  /* Realtime health check: a channel can also die WITHOUT any
+     status callback firing (socket dropped while the laptop slept,
+     token filtered by RLS) and then sit "joined" on paper while
+     delivering nothing. If it is not actually joined, rebuild it —
+     and the fetch below (which verifies the session first) covers
+     whatever it missed while it was down. */
+  if (realtimeChannel && realtimeChannel.state && (realtimeChannel.state === "closed" || realtimeChannel.state === "errored")) resubscribeRealtime();
   if (!adminUnlocked) { fetchOwnOrderStatuses(function(){ refreshCustomerTracking(); }); return; }
   var beforeSig = ordersSignature(cloudOrders);
   var beforeIds = {};

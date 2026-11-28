@@ -819,8 +819,40 @@ function initSupabase(){
   catch(e){ setSyncChip("error", "Sync error"); return false; }
 }
 function orderToRow(o){
-  return { id:o.id, table_label:o.table, customer_name:o.name || null, note:o.note || null,
+  var row = { id:o.id, table_label:o.table, customer_name:o.name || null, note:o.note || null,
     payment:o.pay, lines:o.lines, subtotal:o.sub, gst:o.gst, total:o.total, status:o.status || "Placed" };
+  /* The phone key is added ONLY when the customer actually gave a
+     number. PostgREST rejects an insert that merely NAMES a column
+     the table does not have — even with a null value — so a no-phone
+     order must never mention the column at all: until the owner adds
+     it, no-phone orders insert exactly as they always did. */
+  if (o.phone) row.phone = o.phone;
+  return row;
+}
+/* True only when an insert error is specifically "the phone column
+   does not exist" (PostgREST schema-cache error PGRST204) — other
+   errors (duplicate key, constraint, network) must surface as-is,
+   never be masked by a silent retry. */
+function isMissingPhoneColumnError(err){
+  if (!err) return false;
+  if (err.code === "PGRST204") return true;
+  var m = String(err.message || "");
+  return m.indexOf("phone") !== -1 && (m.indexOf("column") !== -1 || m.indexOf("schema cache") !== -1);
+}
+/* Insert one order row, tolerating a database that has no "phone"
+   column yet: if — and only if — the insert fails because that
+   column is missing, retry once with the phone removed, so the order
+   itself is never lost just because the optional column has not been
+   added. Once the owner adds the column, the first attempt succeeds
+   and the phone is stored with the order. */
+function insertRowTolerant(row){
+  return sbClient.from("orders").insert([row]).then(function(res){
+    if (res.error && row.phone && isMissingPhoneColumnError(res.error)) {
+      var copy = {}; for (var k in row) copy[k] = row[k]; delete copy.phone;
+      return sbClient.from("orders").insert([copy]);
+    }
+    return res;
+  });
 }
 /* SECURITY: rows come from a database that anyone with the public key can
    write to, so NOTHING in a row is trusted. Every field is type-checked,
@@ -840,15 +872,22 @@ function safeMoney(v){ var n = parseInt(v, 10); if (!(n >= 0)) return 0; return 
 function rowToOrder(r){
   var d = r.created_at ? new Date(r.created_at) : new Date();
   var st = String(r.status || "Placed"); if (["Placed","Accepted","Preparing","Ready","Completed","Cancelled"].indexOf(st) === -1) st = "Placed";
-  return { id:String(r.id || ""), table:String(r.table_label || "").slice(0, 40), tableRaw:"", name:String(r.customer_name || "").slice(0, 60), note:String(r.note || "").slice(0, 200),
+  return { id:String(r.id || ""), table:String(r.table_label || "").slice(0, 40), tableRaw:"", name:String(r.customer_name || "").slice(0, 60), phone:String(r.phone || "").replace(/[^0-9+]/g, "").slice(0, 20), note:String(r.note || "").slice(0, 200),
     pay:String(r.payment || "").slice(0, 40), lines:safeLines(r.lines), sub:safeMoney(r.subtotal), gst:safeMoney(r.gst),
     total:safeMoney(r.total), status:st, ts:d.getTime(), dateISO:d.toISOString(),
     time:d.toLocaleTimeString("en-IN", { hour:"numeric", minute:"2-digit" }),
     dateLabel:d.toLocaleDateString("en-IN", { day:"numeric", month:"short", year:"numeric" }), cloud:true };
 }
+/* Full order rows (names, phone numbers, amounts) are OWNER data:
+   they are read through the signed-in admin session whenever one is
+   active, so the database can restrict SELECT to the authenticated
+   owner only. Customer devices never use this full read for their
+   own tracking — they use fetchOwnOrderStatuses() below, which asks
+   only for the status of this phone's own order ids. */
+function ordersReadClient(){ return (adminUnlocked && sbAuthClient) ? sbAuthClient : sbClient; }
 function fetchCloudOrders(cb){
   if (!cloudEnabled || !sbClient) { if (cb) cb(false); return; }
-  sbClient.from("orders").select("*").order("created_at", { ascending:false }).limit(500)
+  ordersReadClient().from("orders").select("*").order("created_at", { ascending:false }).limit(500)
     .then(function(res){
       if (res.error) { setSyncChip("error", "Sync error"); if (cb) cb(false); return; }
       cloudOrders = (res.data || []).map(rowToOrder);
@@ -858,7 +897,7 @@ function fetchCloudOrders(cb){
 }
 function insertCloudOrder(o, cb){
   if (!cloudEnabled || !sbClient) { cb(false, "not configured"); return; }
-  sbClient.from("orders").insert([orderToRow(o)]).then(function(res){
+  insertRowTolerant(orderToRow(o)).then(function(res){
     if (res.error) { cb(false, res.error.message || "insert failed"); return; }
     if (cloudOrders) cloudOrders.unshift(o);
     cb(true, "");
@@ -866,7 +905,42 @@ function insertCloudOrder(o, cb){
 }
 function updateCloudStatus(id, status, cb){
   if (!cloudEnabled || !sbClient) { cb(false); return; }
-  sbClient.from("orders").update({ status:status }).eq("id", id).then(function(res){ cb(!res.error); }, function(){ cb(false); });
+  ordersReadClient().from("orders").update({ status:status }).eq("id", id).then(function(res){ cb(!res.error); }, function(){ cb(false); });
+}
+/* Customer-side status lookup: returns ONLY {id, status} for the
+   orders placed on THIS phone — never the full orders table, never
+   other customers' names or phone numbers. Prefers the database's
+   wt_order_statuses() function (works even when SELECT on the orders
+   table is restricted to the owner); falls back to a narrow
+   id+status select on projects that still allow it. */
+var ownStatusMap = null; /* order id -> latest status, from the lookup above */
+function fetchOwnOrderStatuses(cb){
+  if (!cloudEnabled || !sbClient) { if (cb) cb(false); return; }
+  var ids = loadOrders().map(function(o){ return o.id; }).filter(Boolean).slice(0, 50);
+  if (!ids.length) { if (cb) cb(true); return; }
+  function apply(rows){
+    ownStatusMap = ownStatusMap || {};
+    (rows || []).forEach(function(r){ if (r && r.id) ownStatusMap[String(r.id)] = String(r.status || "Placed"); });
+    if (cb) cb(true);
+  }
+  function fallback(){
+    sbClient.from("orders").select("id,status").in("id", ids).then(function(r2){
+      if (r2.error) { if (cb) cb(false); return; }
+      apply(r2.data || []);
+    }, function(){ if (cb) cb(false); });
+  }
+  try {
+    sbClient.rpc("wt_order_statuses", { ids: ids }).then(function(res){
+      if (!res.error && Array.isArray(res.data)) apply(res.data);
+      else fallback();
+    }, fallback);
+  } catch(e){ fallback(); }
+}
+function latestStatusFor(id){
+  var st = null;
+  if (ownStatusMap && ownStatusMap[id]) st = ownStatusMap[id];
+  if (cloudOrders) cloudOrders.forEach(function(o){ if (o.id === id) st = o.status; });
+  return st;
 }
 /* offline queue: orders that could not reach Supabase yet */
 function loadPending(){ try { var a = JSON.parse(localStorage.getItem(PENDING_KEY) || "[]"); return Array.isArray(a) ? a : []; } catch(e){ return []; } }
@@ -879,10 +953,10 @@ function retryPending(){
   var chain = Promise.resolve();
   p.forEach(function(o){
     chain = chain.then(function(){
-      return sbClient.from("orders").insert([orderToRow(o)]).then(function(res){ if (res.error && res.error.code !== "23505") remain.push(o); /* 23505 = duplicate key: the order already reached the database, treat as delivered instead of retrying forever */ }, function(){ remain.push(o); });
+      return insertRowTolerant(orderToRow(o)).then(function(res){ if (res.error && res.error.code !== "23505") remain.push(o); /* 23505 = duplicate key: the order already reached the database, treat as delivered instead of retrying forever */ }, function(){ remain.push(o); });
     });
   });
-  chain.then(function(){ savePending(remain); if (remain.length < p.length) fetchCloudOrders(function(){ if (adminUnlocked) renderAdmin(); }); });
+  chain.then(function(){ savePending(remain); if (remain.length < p.length) { if (adminUnlocked) fetchCloudOrders(function(){ renderAdmin(); }); else fetchOwnOrderStatuses(function(){ refreshCustomerTracking(); }); } });
 }
 window.addEventListener("online", function(){ retryPending(); toast("Back online — syncing pending orders"); });
 /* new-order sound (admin) — the owner's own music file (a ~23s happy
@@ -1088,21 +1162,39 @@ function beep(){
   testSoundTimer = setTimeout(maybeStopSound, 8100);
   setTimeout(function(){ verifySoundToast("✓ Sound chal raha hai — yahi music naya order aane pe Accept dabane tak loop me bajegi", "✗ Sound nahi baja — 🔊 Enable sound dabao; phir bhi na baje to Chrome site settings me Sound = Allow karo"); }, 900);
 }
+var realtimeClient = null; /* the client that owns realtimeChannel */
 function subscribeRealtime(){
   if (!cloudEnabled || !sbClient || realtimeChannel) return;
+  /* The owner's browser subscribes through the signed-in session, so
+     live updates keep flowing even when the database restricts order
+     reads to the authenticated owner. Customer devices subscribe as
+     anon and only ever refresh their own orders' statuses. */
+  var client = (adminUnlocked && sbAuthClient) ? sbAuthClient : sbClient;
   try {
-    realtimeChannel = sbClient.channel("wt-orders")
+    realtimeClient = client;
+    realtimeChannel = client.channel("wt-orders")
       .on("postgres_changes", { event:"*", schema:"public", table:"orders" }, function(payload){
         var isNew = payload.eventType === "INSERT";
-        fetchCloudOrders(function(){
-          refreshCustomerTracking(); /* customer's own live status tracker */
-          syncOrderAlerts(); /* an order accepted/cancelled anywhere stops its alert */
-          if (isNew && payload.new) alertNewOrder(rowToOrder(payload.new));
-          if ($("adminView").classList.contains("on") && adminUnlocked) renderAdmin();
-        });
+        if (adminUnlocked) {
+          fetchCloudOrders(function(){
+            refreshCustomerTracking(); /* customer's own live status tracker */
+            syncOrderAlerts(); /* an order accepted/cancelled anywhere stops its alert */
+            if (isNew && payload.new) alertNewOrder(rowToOrder(payload.new));
+            if ($("adminView").classList.contains("on")) renderAdmin();
+          });
+        } else {
+          /* customer device: refresh ONLY this phone's own order
+             statuses — never the full orders table */
+          fetchOwnOrderStatuses(function(){ refreshCustomerTracking(); });
+        }
       })
       .subscribe();
   } catch(e){}
+}
+function resubscribeRealtime(){
+  if (realtimeChannel && realtimeClient) { try { realtimeClient.removeChannel(realtimeChannel); } catch(e){} }
+  realtimeChannel = null; realtimeClient = null;
+  subscribeRealtime();
 }
 
 /* ================= NEW-ORDER ALERTS (admin) =================
@@ -1272,7 +1364,7 @@ function renderOrderAlerts(){
   lastPopupId = cur;
   wrap.innerHTML = '<div class="' + cls + '" role="alert">'
     + '<div class="oalert-head"><span class="oalert-dot"></span><b>NEW ORDER — ' + esc(o.table || "") + '</b><span>' + inr(o.total || 0) + '</span></div>'
-    + '<div class="oalert-meta">' + esc(o.id) + (o.name ? ' • ' + esc(o.name) : '') + (o.time ? ' • ' + esc(o.time) : '') + '</div>'
+    + '<div class="oalert-meta">' + esc(o.id) + (o.name ? ' • ' + esc(o.name) : '') + (o.phone ? ' • ' + esc(o.phone) : '') + (o.time ? ' • ' + esc(o.time) : '') + '</div>'
     + (items ? '<div class="oalert-items">' + items + '</div>' : '')
     + (more > 0 ? '<div class="oalert-more">+' + more + ' more order' + (more > 1 ? 's' : '') + ' waiting — Accept this one to see the next</div>' : '')
     + ((soundBlocked || !audioUnlocked) ? '<button class="soundbtn" type="button" data-alert-sound="1">🔊 Sound band hai — music chalu karne ke liye yahan tap karo</button>' : '')
@@ -1334,7 +1426,7 @@ function fireOrderNotification(o){
     if (!("Notification" in window) || Notification.permission !== "granted") return;
     var items = (o.lines || []).map(function(l){ return l.qty + " × " + l.name; }).join(", ");
     var n = new Notification("🔔 New order — " + (o.table || "") + " • " + inr(o.total || 0), {
-      body: (o.name ? o.name + " • " : "") + items + "\nTap to open — the Accept button is on the pop-up at the top.",
+      body: (o.name ? o.name + " • " : "") + (o.phone ? o.phone + " • " : "") + items + "\nTap to open — the Accept button is on the pop-up at the top.",
       tag: "wt-order-" + o.id,
       requireInteraction: true,
       renotify: true,
@@ -1368,7 +1460,15 @@ function catchUpOrderAlerts(){
     if (o.status === "Placed" && (o.ts || 0) >= cutoff) alertNewOrder(o);
   });
 }
-var SQL_SCHEMA = "create table public.orders (\n  id text primary key,\n  table_label text not null check (table_label in ('Table 1','Table 2','Table 3','Table 4','Table 5','Table 6','Table 7','Table 8','Table 9','Table 10','Table 11','Table 12','Takeaway')),\n  customer_name text check (char_length(customer_name) <= 60),\n  note text check (char_length(note) <= 200),\n  payment text check (payment in ('Pay at counter','UPI')),\n  lines jsonb not null default '[]'::jsonb check (jsonb_typeof(lines) = 'array' and jsonb_array_length(lines) between 1 and 100),\n  subtotal integer not null default 0 check (subtotal between 0 and 100000),\n  gst integer not null default 0 check (gst between 0 and 5000),\n  total integer not null default 0 check (total between 1 and 105000),\n  status text not null default 'Placed' check (status in ('Placed','Accepted','Preparing','Ready','Completed','Cancelled')),\n  created_at timestamptz not null default now(),\n  check (total = subtotal + gst),\n  check (abs(gst - round(subtotal * 0.05)) <= 1)\n);\nalter table public.orders enable row level security;\ncreate policy \"anon can place orders\" on public.orders\n  for insert to anon with check (status = 'Placed');\ncreate policy \"anon and admin can read orders\" on public.orders\n  for select to anon, authenticated using (true);\ncreate policy \"anon and admin can update status only\" on public.orders\n  for update to anon, authenticated using (true)\n  with check (status in ('Placed','Accepted','Preparing','Ready','Completed','Cancelled'));\nrevoke update on table public.orders from anon, authenticated;\ngrant update (status) on table public.orders to anon, authenticated;\ngrant select, insert on table public.orders to anon, authenticated;\nalter publication supabase_realtime add table public.orders;";
+var SQL_SCHEMA = "create table public.orders (\n  id text primary key,\n  table_label text not null check (table_label in ('Table 1','Table 2','Table 3','Table 4','Table 5','Table 6','Table 7','Table 8','Table 9','Table 10','Table 11','Table 12','Takeaway')),\n  customer_name text check (char_length(customer_name) <= 60),\n  phone text check (char_length(phone) <= 20),\n  note text check (char_length(note) <= 200),\n  payment text check (payment in ('Pay at counter','UPI')),\n  lines jsonb not null default '[]'::jsonb check (jsonb_typeof(lines) = 'array' and jsonb_array_length(lines) between 1 and 100),\n  subtotal integer not null default 0 check (subtotal between 0 and 100000),\n  gst integer not null default 0 check (gst between 0 and 5000),\n  total integer not null default 0 check (total between 1 and 105000),\n  status text not null default 'Placed' check (status in ('Placed','Accepted','Preparing','Ready','Completed','Cancelled')),\n  created_at timestamptz not null default now(),\n  check (total = subtotal + gst),\n  check (abs(gst - round(subtotal * 0.05)) <= 1)\n);\nalter table public.orders enable row level security;\ncreate policy \"anon can place orders\" on public.orders\n  for insert to anon with check (status = 'Placed');\ncreate policy \"admin can read orders\" on public.orders\n  for select to authenticated using (true);\ncreate policy \"admin can update status only\" on public.orders\n  for update to authenticated using (true)\n  with check (status in ('Placed','Accepted','Preparing','Ready','Completed','Cancelled'));\nrevoke update on table public.orders from anon, authenticated;\ngrant update (status) on table public.orders to authenticated;\ngrant select on table public.orders to authenticated;\ngrant insert on table public.orders to anon, authenticated;\ncreate or replace function public.wt_order_statuses(ids text[])\n  returns table (id text, status text)\n  language sql security definer set search_path = public\n  as $$ select o.id, o.status from public.orders o where o.id = any(ids) $$;\nrevoke all on function public.wt_order_statuses(text[]) from public;\ngrant execute on function public.wt_order_statuses(text[]) to anon, authenticated;\nalter publication supabase_realtime add table public.orders;";
+/* Privacy upgrade for a project created with the OLDER setup SQL
+   (where anyone holding the public link could read every order).
+   Run once in Supabase SQL Editor: afterwards only the signed-in
+   owner can read orders (names, phone numbers, amounts); customers
+   can still place orders, and their phones can still check their own
+   order's status through wt_order_statuses(), which returns nothing
+   but id + status for the exact order ids asked about. */
+var SQL_UPGRADE = "drop policy if exists \"anon and admin can read orders\" on public.orders;\ndrop policy if exists \"anon and admin can update status only\" on public.orders;\ncreate policy \"admin can read orders\" on public.orders\n  for select to authenticated using (true);\ncreate policy \"admin can update status only\" on public.orders\n  for update to authenticated using (true)\n  with check (status in ('Placed','Accepted','Preparing','Ready','Completed','Cancelled'));\nrevoke select, update on table public.orders from anon;\ngrant select on table public.orders to authenticated;\ngrant update (status) on table public.orders to authenticated;\ncreate or replace function public.wt_order_statuses(ids text[])\n  returns table (id text, status text)\n  language sql security definer set search_path = public\n  as $$ select o.id, o.status from public.orders o where o.id = any(ids) $$;\nrevoke all on function public.wt_order_statuses(text[]) from public;\ngrant execute on function public.wt_order_statuses(text[]) to anon, authenticated;";
 /* ================= RENDER MENU ================= */
 function controlHTML(id){
   var q = cart[id] || 0;
@@ -1522,6 +1622,9 @@ function renderCartSheet(resetScroll){
     + '<div class="field"><label for="fName">Your name <span style="color:var(--red-dark);">*</span></label>'
     + '<input id="fName" type="text" placeholder="e.g. Rahul" autocomplete="name" maxlength="60" required aria-required="true" />'
     + '<div class="hint">Required — the kitchen calls this name when your order is ready.</div></div>'
+    + '<div class="field"><label for="fPhone">Phone number <span style="color:var(--ink2);font-weight:600;">(optional)</span></label>'
+    + '<input id="fPhone" type="tel" inputmode="numeric" autocomplete="tel" maxlength="15" placeholder="e.g. 9876543210" />'
+    + '<div class="hint">Optional — only if the cafe may need to call you about this order. Enter a 10-digit mobile number, or leave it blank.</div></div>'
     + '<div class="field"><label for="fNote">Anything we should know? <span style="color:var(--ink2);font-weight:600;">(optional)</span></label>'
     + '<textarea id="fNote" placeholder="Less spicy, extra chutney, no onion…" maxlength="200"></textarea></div>'
     + '<div class="field"><label>Payment</label><div class="payrow">'
@@ -1544,6 +1647,7 @@ function renderCartSheet(resetScroll){
 /* ================= PLACE ORDER ================= */
 function orderText(o){
   var lines = ["🍜 NEW ORDER — WOK TALES", "Order: " + o.id, "Table: " + o.table, "Name: " + (o.name || "—")];
+  if (o.phone) lines.push("Phone: " + o.phone);
   lines.push("--------------------------");
   o.lines.forEach(function(l){ lines.push(l.qty + " × " + l.name + " — " + inr(l.qty * l.price)); });
   lines.push("--------------------------");
@@ -1575,6 +1679,18 @@ function placeOrder(){
     if (fn) { fn.style.borderColor = "var(--red)"; fn.focus(); fn.scrollIntoView({ block:"center", behavior:"smooth" }); }
     return;
   }
+  /* Phone number is OPTIONAL — the order must place fine without one.
+     If the customer typed something, it must be a valid 10-digit
+     mobile number (a leading 91 or 0 is stripped first). */
+  var phoneVal = ($("fPhone") ? $("fPhone").value.replace(/\D/g, "") : "");
+  if (phoneVal.length === 12 && phoneVal.indexOf("91") === 0) phoneVal = phoneVal.slice(2);
+  else if (phoneVal.length === 11 && phoneVal.charAt(0) === "0") phoneVal = phoneVal.slice(1);
+  if (phoneVal && !/^[0-9]{10}$/.test(phoneVal)) {
+    toast("Phone number sahi nahi hai — 10-digit mobile number daalo, ya khaali chhod do");
+    var fp = $("fPhone");
+    if (fp) { fp.style.borderColor = "var(--red)"; fp.focus(); fp.scrollIntoView({ block:"center", behavior:"smooth" }); }
+    return;
+  }
   var lines = [];
   for (var id in cart) lines.push({ name: ITEMS[id].name, price: ITEMS[id].price, qty: Math.min(cart[id], 20) });
   if (!lines.length) { toast("Your order is empty — add an item first"); return; }
@@ -1591,6 +1707,7 @@ function placeOrder(){
     table: tableNo === "Takeaway" ? "Takeaway" : "Table " + tableNo,
     tableRaw: tableNo,
     name: nameVal,
+    phone: phoneVal,
     note: ($("fNote") ? $("fNote").value.trim().slice(0, 200) : ""),
     pay: payEl ? payEl.value : "Pay at counter",
     lines: lines, sub: sub, gst: gst, total: sub + gst,
@@ -1642,7 +1759,9 @@ function renderSuccess(){
     + '<div class="srow"><span>Subtotal</span><span>'+inr(o.sub)+'</span></div>'
     + '<div class="srow"><span>GST (5%)</span><span>'+inr(o.gst)+'</span></div>'
     + '<div class="srow" style="font-weight:800;color:var(--ink);font-size:.98rem;"><span>Total to pay</span><span>'+inr(o.total)+'</span></div>'
-    + '<div class="srow"><span>Payment</span><span>'+esc(o.pay)+'</span></div></div>'
+    + '<div class="srow"><span>Payment</span><span>'+esc(o.pay)+'</span></div>'
+    + (o.phone ? '<div class="srow"><span>Phone</span><span>'+esc(o.phone)+'</span></div>' : '')
+    + '</div>'
     + '<a class="tgbtn" href="'+tg+'" target="_blank" rel="noopener">'
     + '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M21.9 4.6 18.8 19.3c-.2 1-.8 1.2-1.7.8l-4.6-3.4-2.2 2.1c-.3.3-.5.5-1 .5l.3-4.6 8.4-7.6c.4-.3-.1-.5-.6-.2L6.6 13.7 2.1 12.3c-1-.3-1-1 .2-1.4l17.5-6.8c.8-.3 1.5.2 1.1 1.5Z"/></svg>'
     + (lastOrderSynced ? 'Also send on Telegram (optional backup)' : 'Send order to the cafe on Telegram') + '</a>'
@@ -1710,9 +1829,12 @@ function trackInnerHTML(status){
    Returns the list of status changes it applied. */
 function syncLocalStatuses(){
   var changes = [];
-  if (!cloudOrders) return changes;
   var byId = {};
-  cloudOrders.forEach(function(o){ byId[o.id] = o; });
+  if (cloudOrders) cloudOrders.forEach(function(o){ byId[o.id] = o; });
+  /* the customer-side status-only lookup feeds the same merge, so
+     tracking works without ever downloading the full orders table */
+  if (ownStatusMap) for (var k in ownStatusMap) byId[k] = { status: ownStatusMap[k] };
+  if (!cloudOrders && !ownStatusMap) return changes;
   var list = loadOrders(), dirty = false;
   list.forEach(function(o){
     var c = byId[o.id];
@@ -1742,8 +1864,7 @@ function renderTracking(){
 }
 function updateSuccessTrack(){
   var box = $("successTrack"); if (!box || !lastOrder) return;
-  var st = lastOrder.status || "Placed";
-  if (cloudOrders) cloudOrders.forEach(function(o){ if (o.id === lastOrder.id) st = o.status; });
+  var st = latestStatusFor(lastOrder.id) || lastOrder.status || "Placed";
   box.innerHTML = trackInnerHTML(st);
 }
 var trackingPrimed = false;
@@ -1785,7 +1906,7 @@ function filteredOrders(){
   if (adminStatusFilter!=="All") list = list.filter(function(o){ return o.status===adminStatusFilter; });
   if (adminSearch){
     var q = adminSearch.toLowerCase();
-    list = list.filter(function(o){ return (o.id+" "+(o.name||"")+" "+(o.table||"")).toLowerCase().indexOf(q)!==-1; });
+    list = list.filter(function(o){ return (o.id+" "+(o.name||"")+" "+(o.phone||"")+" "+(o.table||"")).toLowerCase().indexOf(q)!==-1; });
   }
   return list;
 }
@@ -1848,7 +1969,7 @@ function renderAdmin(){
     var next = NEXT_STATUS[o.status];
     ordersHTML += '<article class="ordercard" data-order-card="'+esc(o.id)+'"><div class="orderhead"><div><b>'+esc(o.id)+'</b> <span style="color:var(--ink2);font-weight:700;font-size:.82rem;">• '+esc(o.table||"")+' • '+esc(o.dateLabel||"")+' '+esc(o.time||"")+'</span></div><span class="statuspill status-'+esc(o.status||"Placed")+'">'+esc(o.status||"Placed")+'</span></div>'
       + '<div class="orderlines">'+linesHTML+'</div>'
-      + '<div class="ordermeta">Customer: <b>'+esc(o.name||"—")+'</b> &nbsp;•&nbsp; Payment: '+esc(o.pay||"—")+(o.note?' &nbsp;•&nbsp; Note: '+esc(o.note):'')+'<br/>Subtotal '+inr(o.sub||0)+' + GST '+inr(o.gst||0)+' = <b style="color:var(--ink);">'+inr(o.total||0)+'</b></div>'
+      + '<div class="ordermeta">Customer: <b>'+esc(o.name||"—")+'</b>'+(o.phone?' &nbsp;•&nbsp; Phone: <b>'+esc(o.phone)+'</b>':'')+' &nbsp;•&nbsp; Payment: '+esc(o.pay||"—")+(o.note?' &nbsp;•&nbsp; Note: '+esc(o.note):'')+'<br/>Subtotal '+inr(o.sub||0)+' + GST '+inr(o.gst||0)+' = <b style="color:var(--ink);">'+inr(o.total||0)+'</b></div>'
       + '<div class="orderactions">'
       + (next ? '<button class="btn red small" data-advance="'+esc(o.id)+'" type="button">Mark '+next+' →</button>' : '')
       + STATUSES.map(function(s){ return '<button class="btn small" data-setstatus="'+esc(o.id)+'|'+s+'" type="button">'+s+'</button>'; }).join("")
@@ -1888,15 +2009,17 @@ function renderAdmin(){
     + '2. <b>Make the 5 table QRs:</b> paste that public link in the Table QR section above, generate the 5 QRs, print each one (at least 4×4 cm) and put <b>each QR only on its own table</b> — Table 1 QR on Table 1, Table 2 QR on Table 2, and so on.<br/>'
     + '3. <b>Test like a customer:</b> scan the Table 1 QR with your phone — the site should open with Table 1 already selected — place a small order, and watch it appear here within a second or two.'
     + '</div>'
-    + '<div class="notebox" style="margin-bottom:0;">Security status of this page: only the <b>publishable</b> key is in the code — the secret key is never in this website, and no admin password or verifier is in the code either: the admin login is checked by <b>Supabase Auth on the server</b>. One honest limit: anyone holding the public link + publishable key could read order names and table numbers from the database — never type anything sensitive in the order note.</div></div>'
+    + '<div class="notebox" style="margin-bottom:0;">Security status of this page: only the <b>publishable</b> key is in the code — the secret key is never in this website, and no admin password or verifier is in the code either: the admin login is checked by <b>Supabase Auth on the server</b>. Order details (names, phone numbers) are readable <b>only by the signed-in owner</b> once the privacy upgrade SQL in the Database section below has been run — customers can place orders and check only their own order\'s status. Still: never type anything sensitive in the order note.</div></div>'
     + '<div class="panelcard"><h4>Database (Supabase) — free live sync</h4>'
     + '<p style="margin:0 0 8px;color:var(--ink2);font-weight:600;font-size:.86rem;line-height:1.55;">Connect a free Supabase project and orders from <b>every customer phone</b> appear in this panel live — no Telegram tap, no backend to run. Setup: 1) Create a free project at supabase.com. 2) SQL Editor → run the table SQL below. 3) Settings → API → paste the Project URL + <b>anon public</b> key here. 4) Save &amp; connect, then Test connection.</p>'
-    + '<div class="notebox" style="margin-top:0;">⚠️ Use ONLY the <b>publishable / anon public</b> key. <b>Never</b> paste the <b>secret / service_role</b> key anywhere in this website — it bypasses all security. The public key is safe here only because Row Level Security (RLS) is on — do not disable RLS. Honest limit: read access is open so this panel can work without a separate staff account, so anyone with the link + public key could read order names / table numbers — never ask customers to type anything sensitive in the order note.</div>'
+    + '<div class="notebox" style="margin-top:0;">⚠️ Use ONLY the <b>publishable / anon public</b> key. <b>Never</b> paste the <b>secret / service_role</b> key anywhere in this website — it bypasses all security. The public key is safe here only because Row Level Security (RLS) is on — do not disable RLS. The current setup SQL restricts order reads to the <b>signed-in owner only</b>; agar ye project purane SQL se bana tha (jisme reads sabke liye open the), to neeche wala <b>Privacy upgrade SQL</b> ek baar Supabase SQL Editor me chalao — uske baad customer ke naam / phone number sirf owner ko dikhenge, aur customers sirf apne order ka status dekh payenge.</div>'
     + '<div class="field"><label for="dbUrlInput">Supabase Project URL</label><input id="dbUrlInput" type="url" placeholder="https://xxxx.supabase.co" value="'+esc(getDbConfig().url)+'" /></div>'
     + '<div class="field"><label for="dbKeyInput">Supabase anon public key</label><input id="dbKeyInput" type="password" placeholder="Publishable / anon key only — never the secret key" value="'+esc(getDbConfig().key)+'" autocomplete="off" /></div>'
     + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;"><button class="btn teal" id="saveDbBtn" type="button">Save &amp; connect</button><button class="btn" id="testDbBtn" type="button">Test connection</button><button class="btn" id="clearDbBtn" type="button">Disconnect (Local only)</button></div>'
     + '<div class="dbstatus" id="dbStatus">' + (cloudEnabled ? 'Status: <b>Live sync ON</b> — orders sync with Supabase.' : 'Status: <b>Local only</b> — no database connected. Orders are stored on each device only.') + (loadPending().length ? '<br/>Pending orders waiting to sync: <b>'+loadPending().length+'</b>' : '') + '</div>'
     + '<details class="sqlwrap"><summary>Table SQL — for a NEW Supabase project (tap to open)</summary><div class="sqlbox" id="sqlBox">'+esc(SQL_SCHEMA)+'</div><button class="btn small" id="copySqlBtn" type="button" style="margin-top:8px;">Copy SQL</button></details>'
+    + '<div class="notebox"><b>Customer phone numbers (optional column):</b> checkout pe customer apna phone number bhi de sakta hai (optional hai). Use database me store karne ke liye Supabase SQL Editor me ye ek line chalao: <b>alter table public.orders add column if not exists phone text;</b> Jab tak ye column nahi hai, orders phir bhi bilkul normal place honge — bas phone number database me save nahi hoga. Column add hote hi phone apne aap har order ke saath save hone lagega, is panel me dikhega aur CSV me bhi aayega.</div>'
+    + '<details class="sqlwrap"><summary>Privacy upgrade SQL — purane project ke liye (ek baar chalao)</summary><div class="sqlbox" id="upgradeSqlBox">'+esc(SQL_UPGRADE)+'</div><button class="btn small" id="copyUpgradeSqlBtn" type="button" style="margin-top:8px;">Copy upgrade SQL</button><p style="font-size:.78rem;color:var(--ink2);font-weight:600;line-height:1.5;">Ye chalane ke baad orders sirf <b>logged-in owner</b> padh sakega — customer naam / phone number kisi aur ko nahi dikhenge. Customers order phir bhi place kar sakenge aur apne order ka status bhi dekh sakenge (status-only function se). Owner Panel band karke dobara kholo to naya setup apply ho jayega.</p></details>'
     + '</div>'
     + '<div class="panelcard"><h4>Admin account &amp; settings</h4>'
     + '<p style="margin:0 0 4px;color:var(--ink2);font-weight:600;font-size:.86rem;line-height:1.55;">Yahi se admin apna <b>login email</b>, <b>phone</b> aur <b>password</b> badal sakta hai. Change sirf panel ke andar se hota hai — bahar se koi password reset nahi kar sakta. Change Supabase account pe save hota hai, isliye agli login pe har device pe naya wala chalega. Email badalne pe Supabase naye email pe confirmation bhej sakta hai — wo confirm karne ke baad hi naya email login pe chalega.</p>'
@@ -1915,7 +2038,7 @@ function renderAdmin(){
   var sdb=$("saveDbBtn"); if(sdb) sdb.addEventListener("click", function(){
     var u=($("dbUrlInput").value||"").trim(), k=($("dbKeyInput").value||"").trim();
     if(!u || !k){ toast("Paste both the Project URL and the anon key"); return; }
-    setDbConfig(u,k); realtimeChannel=null;
+    setDbConfig(u,k); realtimeChannel=null; realtimeClient=null;
     if (initSupabase()) { subscribeRealtime(); fetchCloudOrders(function(ok){ renderAdmin(); toast(ok ? "Database connected — Live sync ON" : "Connected, but orders could not load — check the SQL / RLS"); }); retryPending(); }
     else { renderAdmin(); toast("Could not connect — check the URL and key"); }
   });
@@ -1923,14 +2046,15 @@ function renderAdmin(){
     var st=$("dbStatus");
     if(!cloudEnabled || !sbClient){ if(st){ st.className="dbstatus err"; st.innerHTML="Test failed: <b>no database connected</b>. Paste the URL + anon key and tap Save &amp; connect first."; } return; }
     if(st){ st.className="dbstatus"; st.textContent="Testing connection…"; }
-    sbClient.from("orders").select("id").limit(1).then(function(res){
+    ordersReadClient().from("orders").select("id").limit(1).then(function(res){
       if(!st) return;
-      if(res.error){ st.className="dbstatus err"; st.innerHTML="Test failed: <b>"+esc(res.error.message||"unknown error")+"</b><br/>Most common cause: the orders table / SQL has not been run yet, or RLS policies are missing. Run the Table SQL below in Supabase SQL Editor, then test again."; setSyncChip("error","Sync error"); }
+      if(res.error){ st.className="dbstatus err"; st.innerHTML="Test failed: <b>"+esc(res.error.message||"unknown error")+"</b><br/>Most common cause: the orders table / SQL has not been run yet, or RLS policies are missing — ya panel login nahi hai (order reads sirf logged-in owner ko milte hain). Run the Table SQL below in Supabase SQL Editor, then test again."; setSyncChip("error","Sync error"); }
       else { st.className="dbstatus ok"; st.innerHTML="Test passed ✓ — connected to Supabase and the <b>orders</b> table is readable. Live sync is ON."; setSyncChip("live","Live sync ON"); }
     }, function(err){ if(st){ st.className="dbstatus err"; st.textContent="Test failed: network error — " + ((err&&err.message)||"could not reach Supabase"); } setSyncChip("error","Sync error"); });
   });
-  var cdb=$("clearDbBtn"); if(cdb) cdb.addEventListener("click", function(){ disconnectDb(); try{ if(sbClient && realtimeChannel) sbClient.removeChannel(realtimeChannel); }catch(e){} realtimeChannel=null; cloudOrders=null; initSupabase(); renderAdmin(); toast("Database disconnected on this device — Local only mode"); });
+  var cdb=$("clearDbBtn"); if(cdb) cdb.addEventListener("click", function(){ disconnectDb(); try{ if(realtimeClient && realtimeChannel) realtimeClient.removeChannel(realtimeChannel); }catch(e){} realtimeChannel=null; realtimeClient=null; cloudOrders=null; initSupabase(); renderAdmin(); toast("Database disconnected on this device — Local only mode"); });
   var csq=$("copySqlBtn"); if(csq) csq.addEventListener("click", function(){ if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(SQL_SCHEMA).then(function(){ toast("SQL copied — paste it in Supabase SQL Editor"); }, function(){ fallbackCopy(SQL_SCHEMA); toast("SQL copied"); }); else { fallbackCopy(SQL_SCHEMA); toast("SQL copied"); } });
+  var cuq=$("copyUpgradeSqlBtn"); if(cuq) cuq.addEventListener("click", function(){ if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(SQL_UPGRADE).then(function(){ toast("Upgrade SQL copied — paste it in Supabase SQL Editor"); }, function(){ fallbackCopy(SQL_UPGRADE); toast("Upgrade SQL copied"); }); else { fallbackCopy(SQL_UPGRADE); toast("Upgrade SQL copied"); } });
   var ex=$("exportCsvBtn"); if(ex) ex.addEventListener("click", exportCSV);
   var enb=$("enableNotifyBtn"); if(enb) enb.addEventListener("click", function(){ requestNotifyPermission(function(res){ renderAdmin(); toast(res === "granted" ? "Notifications ON — naya order aane pe notification + awaaz aayegi" : res === "denied" ? "Notification blocked hai — browser settings se is site ke liye Allow karo" : res === "unsupported" ? "Is browser me notification nahi chalta — screen alert + awaaz chalega" : "Permission nahi mili — dobara try karo"); }); });
   var tab=$("testAlertBtn"); if(tab) tab.addEventListener("click", function(){ beep(); });
@@ -1967,7 +2091,7 @@ function renderAdmin(){
       var np=$("newPass"); if(np) np.value="";
     }, function(){ sp.disabled = false; toast("Network error — dobara try karo"); });
   });
-  var lk=$("lockAdminBtn"); if(lk) lk.addEventListener("click", function(){ Object.keys(pendingAlerts).forEach(function(id){ clearOrderAlert(id); }); alertSoundStop(); adminUnlocked=false; adminUser=null; if (sbAuthClient && sbAuthClient.auth) sbAuthClient.auth.signOut(); renderAdmin(); toast("Panel locked — logged out"); });
+  var lk=$("lockAdminBtn"); if(lk) lk.addEventListener("click", function(){ Object.keys(pendingAlerts).forEach(function(id){ clearOrderAlert(id); }); alertSoundStop(); adminUnlocked=false; adminUser=null; if (sbAuthClient && sbAuthClient.auth) sbAuthClient.auth.signOut(); resubscribeRealtime(); renderAdmin(); toast("Panel locked — logged out"); });
   var cd=$("clearDoneBtn"); if(cd) cd.addEventListener("click", function(){ $("confirmBox").innerHTML='<div class="notebox">Remove all Completed and Cancelled orders from history on this device?<div style="margin-top:8px;display:flex;gap:8px;"><button class="btn red small" id="confirmClearBtn" type="button">Yes, clear them</button><button class="btn small" id="cancelClearBtn" type="button">Cancel</button></div></div>'; $("confirmClearBtn").addEventListener("click", function(){ saveOrders(loadOrders().filter(function(o){ return o.status!=="Completed"&&o.status!=="Cancelled"; })); toast("Old orders cleared"); renderAdmin(); }); $("cancelClearBtn").addEventListener("click", renderAdmin); });
 }
 function drawQRInto(el, link, size){
@@ -2028,6 +2152,7 @@ function tryAdminLogin(){
     }
     adminUser = res.data.user;
     adminUnlocked = true;
+    resubscribeRealtime(); /* live updates now flow through the signed-in session */
     renderAdmin();
     toast("Welcome back, Owner");
     requestNotifyPermission(); /* ask once, right after the login tap, so new-order notifications can show */
@@ -2045,8 +2170,8 @@ function setOrderStatus(id, status){
 }
 function exportCSV(){
   var list=filteredOrders();
-  var rows=[["Order ID","Date","Time","Table","Customer","Items","Subtotal","GST","Total","Payment","Status","Note"]];
-  list.forEach(function(o){ rows.push([o.id,o.dateLabel||"",o.time||"",o.table||"",o.name||"",(o.lines||[]).map(function(l){return l.qty+"x "+l.name;}).join("; "),o.sub||0,o.gst||0,o.total||0,o.pay||"",o.status||"",(o.note||"").replace(/\n/g," ")]); });
+  var rows=[["Order ID","Date","Time","Table","Customer","Phone","Items","Subtotal","GST","Total","Payment","Status","Note"]];
+  list.forEach(function(o){ rows.push([o.id,o.dateLabel||"",o.time||"",o.table||"",o.name||"",o.phone||"",(o.lines||[]).map(function(l){return l.qty+"x "+l.name;}).join("; "),o.sub||0,o.gst||0,o.total||0,o.pay||"",o.status||"",(o.note||"").replace(/\n/g," ")]); });
   var csv=rows.map(function(r){ return r.map(function(c){ var s=String(c); if (/^[=+\-@\t]/.test(s)) s="'" + s; /* a name/note starting with = + - @ would otherwise run as a spreadsheet formula */ return '"'+s.replace(/"/g,'""')+'"'; }).join(","); }).join("\n");
   var blob=new Blob([csv],{type:"text/csv"}); var a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="wok-tales-orders-"+adminRange+".csv"; document.body.appendChild(a); a.click(); setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); },400); toast("CSV downloaded");
 }
@@ -2061,11 +2186,12 @@ $("openAdminBtn").addEventListener("click", function(){
     sbAuthClient.auth.getSession().then(function(r){
       var s = r && r.data ? r.data.session : null;
       adminUnlocked = !!s; adminUser = s ? s.user : null;
+      if (adminUnlocked) resubscribeRealtime(); /* restored session: live updates via the signed-in client */
       renderAdmin();
       if (cloudEnabled) fetchCloudOrders(function(){ if (adminUnlocked) { renderAdmin(); catchUpOrderAlerts(); } });
     }, function(){ renderAdmin(); });
   } else renderAdmin();
-  if (cloudEnabled) fetchCloudOrders(function(){ if (adminUnlocked) renderAdmin(); });
+  if (cloudEnabled && adminUnlocked) fetchCloudOrders(function(){ renderAdmin(); });
 });
 $("closeAdminBtn").addEventListener("click", function(){ $("adminView").classList.remove("on"); });
 
@@ -2089,7 +2215,7 @@ fitSticky();
 window.addEventListener("resize", fitSticky);
 window.addEventListener("load", fitSticky);
 renderTracking(); /* show this phone's recent orders + their last known status immediately */
-if (initSupabase()) { fetchCloudOrders(function(){ refreshCustomerTracking(); }); subscribeRealtime(); retryPending(); }
+if (initSupabase()) { fetchOwnOrderStatuses(function(){ refreshCustomerTracking(); }); subscribeRealtime(); retryPending(); }
 /* Polling safety net: Realtime normally pushes a new order to the Owner
    Panel in about a second. If the Realtime socket ever drops, this check
    every 15 seconds picks the order up anyway — so an order never sits
@@ -2098,6 +2224,7 @@ if (initSupabase()) { fetchCloudOrders(function(){ refreshCustomerTracking(); })
 function ordersSignature(list){ return (list || []).map(function(o){ return o.id + ":" + (o.status || ""); }).join("|"); }
 setInterval(function(){
   if (!cloudEnabled || !sbClient) return;
+  if (!adminUnlocked) { fetchOwnOrderStatuses(function(){ refreshCustomerTracking(); }); return; }
   var beforeSig = ordersSignature(cloudOrders);
   var beforeIds = {};
   (cloudOrders || []).forEach(function(o){ beforeIds[o.id] = 1; });

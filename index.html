@@ -814,9 +814,34 @@ function initSupabase(){
        anon, exactly like a customer's phone, logged in or not. */
     sbClient = window.supabase.createClient(cfg.url, cfg.key, { auth:{ persistSession:false, autoRefreshToken:false, detectSessionInUrl:false, storageKey:"wt-orders-anon-v1" } });
     sbAuthClient = window.supabase.createClient(cfg.url, cfg.key, { auth:{ persistSession:true, autoRefreshToken:true, detectSessionInUrl:false, storageKey:"wt-admin-auth-v1" } });
+    watchAuthChanges();
     cloudEnabled = true; setSyncChip("live", "Live sync ON"); return true;
   }
   catch(e){ setSyncChip("error", "Sync error"); return false; }
+}
+/* React the moment the admin session changes underneath the page:
+   a token that refreshes successfully re-arms realtime + refetches
+   (so a tab that slept through its token's expiry catches up by
+   itself), and a session that ends WITHOUT the owner tapping Lock
+   (revoked / expired refresh token) drops the panel to the login
+   screen honestly instead of leaving it "unlocked" over stale data.
+   Registered once per auth client instance. */
+function watchAuthChanges(){
+  if (!sbAuthClient || !sbAuthClient.auth || sbAuthClient.__wtWatching) return;
+  sbAuthClient.__wtWatching = true;
+  try {
+    sbAuthClient.auth.onAuthStateChange(function(event, session){
+      if (event === "SIGNED_OUT") { if (adminUnlocked) handleSessionExpired(); return; }
+      if ((event === "TOKEN_REFRESHED" || event === "SIGNED_IN") && adminUnlocked && session) {
+        adminUser = session.user;
+        resubscribeRealtime(); /* realtime authorizes with the fresh token */
+        fetchCloudOrders(function(){
+          syncOrderAlerts(); /* an order accepted elsewhere while this tab slept stops alerting NOW */
+          if ($("adminView") && $("adminView").classList.contains("on")) renderAdmin();
+        });
+      }
+    });
+  } catch(e){}
 }
 function orderToRow(o){
   var row = { id:o.id, table_label:o.table, customer_name:o.name || null, note:o.note || null,
@@ -885,6 +910,62 @@ function rowToOrder(r){
    own tracking — they use fetchOwnOrderStatuses() below, which asks
    only for the status of this phone's own order ids. */
 function ordersReadClient(){ return (adminUnlocked && sbAuthClient) ? sbAuthClient : sbClient; }
+/* ================= ADMIN SESSION SELF-HEALING =================
+   WHY THIS EXISTS (the "owner ke panel me order show hi nahi hua,
+   aur accept karne ke baad bhi notification aata raha" bug): the
+   Owner Panel is a tab the owner keeps open ALL DAY. Supabase access
+   tokens live about an hour; when the laptop sleeps, the tab sits in
+   the background, or the same login is refreshed from two tabs at
+   once, the saved session can die for good (refresh token revoked /
+   expired). From that moment, on THIS device only:
+   - reads through the signed-in client fail with an auth error, and
+     the fallback anon read "succeeds" with ZERO rows (the privacy
+     SQL gives anon no SELECT policy) — so new orders never arrive
+     and known orders keep their last-seen status forever;
+   - realtime events stop too (RLS checks the same dead token);
+   - an order accepted on ANOTHER device therefore stays "Placed"
+     here: its pop-up keeps the Accept button and the reminder timer
+     keeps re-firing the laptop notification again and again.
+   The panel claimed "Live sync ON" through all of it, and nothing
+   ever tried to repair the session. So now the data layer heals
+   itself: an auth-looking error triggers ONE refreshSession() +
+   retry; if the session is genuinely gone (refresh AND getSession
+   both come back empty — a network failure does NOT count, it just
+   retries later), the panel honestly drops to the login screen with
+   a message instead of silently showing stale orders as live. */
+function isAuthError(err){
+  if (!err) return false;
+  if (err.status === 401 || err.status === 403) return true;
+  var m = (String(err.code || "") + " " + String(err.message || "")).toLowerCase();
+  return m.indexOf("jwt") !== -1 || m.indexOf("pgrst301") !== -1 || m.indexOf("token") !== -1 || m.indexOf("not authenticated") !== -1 || m.indexOf("session") !== -1;
+}
+function healAdminSession(cb){
+  if (!sbAuthClient || !sbAuthClient.auth) { cb(false); return; }
+  function viaGetSession(){
+    sbAuthClient.auth.getSession().then(function(r){
+      var s = r && r.data ? r.data.session : null;
+      if (s) adminUser = s.user;
+      cb(!!s);
+    }, function(){ cb(false); });
+  }
+  try {
+    sbAuthClient.auth.refreshSession().then(function(r){
+      var s = r && r.data ? r.data.session : null;
+      if (s) { adminUser = s.user; cb(true); return; }
+      viaGetSession();
+    }, viaGetSession);
+  } catch(e){ viaGetSession(); }
+}
+function handleSessionExpired(){
+  if (!adminUnlocked) return;
+  adminUnlocked = false; adminUser = null;
+  Object.keys(pendingAlerts).forEach(function(id){ clearOrderAlert(id); });
+  alertSoundStop();
+  resubscribeRealtime(); /* back to the anon channel, like a customer device */
+  setSyncChip("error", "Sync error");
+  if ($("adminView") && $("adminView").classList.contains("on")) renderAdmin();
+  toast("Login session expire ho gaya — Owner Panel me dobara login karo, warna naye orders nahi dikhenge aur purane status stale rahenge");
+}
 /* WHY THIS FETCH IS BUILT DEFENSIVELY (the "orders kabhi dikhte hain,
    kabhi gayab" bug): with the privacy-upgrade SQL applied, the anon
    role has NO select policy on the orders table — and PostgREST
@@ -906,7 +987,8 @@ function fetchCloudOrders(cb){
   if (!cloudEnabled || !sbClient) { if (cb) cb(false); return; }
   var primary = ordersReadClient();
   var secondary = (primary === sbAuthClient) ? sbClient : sbAuthClient;
-  function accept(rows){
+  var healed = false; /* one session-refresh + retry per fetch, never a loop */
+  function accept(rows, viaClient){
     var fresh = (rows || []).map(rowToOrder);
     if (cloudOrders && cloudOrders.length){
       var seen = {}; fresh.forEach(function(o){ seen[o.id] = 1; });
@@ -917,7 +999,15 @@ function fetchCloudOrders(cb){
     } else {
       cloudOrders = fresh;
     }
-    setSyncChip("live", "Live sync ON");
+    /* An EMPTY answer from the ANON client while the panel is
+       unlocked is not proof of "no orders": after the privacy SQL
+       the anon role cannot read the table at all, so empty there
+       means "this read was blind". Only claim Live when the read
+       could actually see the table (signed-in client, or it
+       returned rows) — otherwise show the error state honestly so
+       a stale panel never masquerades as a live one. */
+    var blindEmpty = adminUnlocked && viaClient !== sbAuthClient && !fresh.length && ((cloudOrders && cloudOrders.length) || loadOrders().length);
+    setSyncChip(blindEmpty ? "error" : "live", blindEmpty ? "Sync error" : "Live sync ON");
     if (cb) cb(true);
   }
   function attempt(client, isRetry){
@@ -925,12 +1015,27 @@ function fetchCloudOrders(cb){
     client.from("orders").select("*").order("created_at", { ascending:false }).limit(500)
       .then(function(res){
         if (res.error){
+          /* Dead-session repair comes BEFORE the anon fallback: an
+             auth error from the signed-in client means this device's
+             login died (long-open tab, laptop sleep, token revoked).
+             Refresh once and retry the SAME client — falling back to
+             anon first would just "succeed" with a blind empty list
+             and cement the stale state. If no session can be
+             recovered at all, say so honestly via the login screen. */
+          if (client === sbAuthClient && adminUnlocked && !healed && isAuthError(res.error)){
+            healed = true;
+            healAdminSession(function(ok){
+              if (ok) { resubscribeRealtime(); attempt(sbAuthClient, isRetry); }
+              else { handleSessionExpired(); if (!isRetry && secondary) attempt(secondary, true); else if (cb) cb(false); }
+            });
+            return;
+          }
           if (!isRetry && secondary){ attempt(secondary, true); return; }
           setSyncChip("error", "Sync error"); if (cb) cb(false); return;
         }
         var rows = res.data || [];
         if (!rows.length && !isRetry && secondary && ((cloudOrders && cloudOrders.length) || loadOrders().length)){ attempt(secondary, true); return; }
-        accept(rows);
+        accept(rows, client);
       }, function(){
         if (!isRetry && secondary){ attempt(secondary, true); return; }
         setSyncChip("error", "Sync error"); if (cb) cb(false);
@@ -948,7 +1053,24 @@ function insertCloudOrder(o, cb){
 }
 function updateCloudStatus(id, status, cb){
   if (!cloudEnabled || !sbClient) { cb(false); return; }
-  ordersReadClient().from("orders").update({ status:status }).eq("id", id).then(function(res){ cb(!res.error); }, function(){ cb(false); });
+  function send(){
+    return ordersReadClient().from("orders").update({ status:status }).eq("id", id);
+  }
+  send().then(function(res){
+    /* If this device's login died, the update never reached the
+       database — the order would stay "Placed" for every other
+       device and keep alerting there. Heal the session once and
+       send the status again before reporting failure. */
+    if (res.error && adminUnlocked && isAuthError(res.error)){
+      healAdminSession(function(ok){
+        if (!ok) { handleSessionExpired(); cb(false); return; }
+        resubscribeRealtime();
+        send().then(function(r2){ cb(!r2.error); }, function(){ cb(false); });
+      });
+      return;
+    }
+    cb(!res.error);
+  }, function(){ cb(false); });
 }
 /* Customer-side status lookup: returns ONLY {id, status} for the
    orders placed on THIS phone — never the full orders table, never
@@ -1206,6 +1328,11 @@ function beep(){
   setTimeout(function(){ verifySoundToast("✓ Sound chal raha hai — yahi music naya order aane pe Accept dabane tak loop me bajegi", "✗ Sound nahi baja — 🔊 Enable sound dabao; phir bhi na baje to Chrome site settings me Sound = Allow karo"); }, 900);
 }
 var realtimeClient = null; /* the client that owns realtimeChannel */
+var resubscribeTimer = null;
+function scheduleResubscribe(){
+  if (resubscribeTimer) return;
+  resubscribeTimer = setTimeout(function(){ resubscribeTimer = null; resubscribeRealtime(); }, 4000);
+}
 function subscribeRealtime(){
   if (!cloudEnabled || !sbClient || realtimeChannel) return;
   /* The owner's browser subscribes through the signed-in session, so
@@ -1215,7 +1342,7 @@ function subscribeRealtime(){
   var client = (adminUnlocked && sbAuthClient) ? sbAuthClient : sbClient;
   try {
     realtimeClient = client;
-    realtimeChannel = client.channel("wt-orders")
+    var ch = client.channel("wt-orders")
       .on("postgres_changes", { event:"*", schema:"public", table:"orders" }, function(payload){
         var isNew = payload.eventType === "INSERT";
         if (adminUnlocked) {
@@ -1230,8 +1357,17 @@ function subscribeRealtime(){
              statuses — never the full orders table */
           fetchOwnOrderStatuses(function(){ refreshCustomerTracking(); });
         }
-      })
-      .subscribe();
+      });
+    realtimeChannel = ch;
+    ch.subscribe(function(status){
+      /* A socket that errored or timed out (laptop sleep, Wi-Fi
+         drop, long background tab) used to stay dead forever — the
+         panel then depended on luck. Resubscribe it. Only react
+         while this channel is still the current one, so an
+         intentional resubscribe never loops. */
+      if (realtimeChannel !== ch) return;
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") scheduleResubscribe();
+    });
   } catch(e){}
 }
 function resubscribeRealtime(){
@@ -1321,7 +1457,7 @@ function soundGesture(){
 }
 document.addEventListener("pointerdown", soundGesture, false);
 document.addEventListener("keydown", soundGesture, false);
-document.addEventListener("visibilitychange", function(){ if (!document.hidden) { waResume(); if (currentAlertId()) alertPlay(); } }, false);
+document.addEventListener("visibilitychange", function(){ if (!document.hidden) { waResume(); if (currentAlertId()) alertPlay(); pollTick(); /* tab visible again: refetch NOW — an order accepted elsewhere while this tab was hidden must stop its pop-up, sound and notifications immediately, not at the next poll */ } }, false);
 (function(){ var a = alertAudioEl(); if (a) a.addEventListener("error", function(){ soundFileError = true; updateSoundUI(); }, false); waInit(); /* fetch + decode the music now, so it is ready the moment an order arrives */ })();
 
 function alertSoundStart(){
@@ -1334,7 +1470,13 @@ function alertSoundStart(){
       var cur = currentAlertId();
       if (!cur) { alertSoundStop(); return; }
       alertPlay();
-      if (pendingAlerts[cur]) fireOrderNotification(pendingAlerts[cur]);
+      /* Re-fire the system notification ONLY if the previous one is
+         gone (the owner dismissed it): requireInteraction already
+         keeps a live one pinned on screen, and blindly creating a
+         new Notification every 25s stacked duplicates in the
+         laptop's notification centre — the exact complaint that
+         brought us here. The music still re-asserts every tick. */
+      if (pendingAlerts[cur] && !alertNotifs[cur]) fireOrderNotification(pendingAlerts[cur]);
     }, 25000);
   }
 }
@@ -1467,6 +1609,14 @@ function openAdminToOrder(id){
 function fireOrderNotification(o){
   try {
     if (!("Notification" in window) || Notification.permission !== "granted") return;
+    /* Never stack a second notification for the same order: close
+       the one already showing first (tag replacement alone proved
+       unreliable — the owner's laptop ended up with two cards for
+       one order). onclose forgets a notification the owner
+       dismissed, which is what licenses ONE reminder re-fire from
+       the 25s timer; while a notification is still on screen, the
+       timer leaves it alone. */
+    if (alertNotifs[o.id]) { try { alertNotifs[o.id].close(); } catch(e){} delete alertNotifs[o.id]; }
     var items = (o.lines || []).map(function(l){ return l.qty + " × " + l.name; }).join(", ");
     var n = new Notification("🔔 New order — " + (o.table || "") + " • " + inr(o.total || 0), {
       body: (o.name ? o.name + " • " : "") + (o.phone ? o.phone + " • " : "") + items + "\nTap to open — the Accept button is on the pop-up at the top.",
@@ -1478,6 +1628,7 @@ function fireOrderNotification(o){
       badge: logoSrc()
     });
     n.onclick = function(){ openAdminToOrder(o.id); };
+    n.onclose = function(){ if (alertNotifs[o.id] === n) delete alertNotifs[o.id]; };
     alertNotifs[o.id] = n;
   } catch(e){}
 }
@@ -2281,7 +2432,7 @@ if (initSupabase()) { fetchOwnOrderStatuses(function(){ refreshCustomerTracking(
    unseen just because a connection hiccuped. It only re-renders when the
    order list actually changed, so it never disturbs typing in the panel. */
 function ordersSignature(list){ return (list || []).map(function(o){ return o.id + ":" + (o.status || ""); }).join("|"); }
-setInterval(function(){
+function pollTick(){
   if (!cloudEnabled || !sbClient) return;
   if (!adminUnlocked) { fetchOwnOrderStatuses(function(){ refreshCustomerTracking(); }); return; }
   var beforeSig = ordersSignature(cloudOrders);
@@ -2295,7 +2446,17 @@ setInterval(function(){
     if (adminUnlocked) cloudOrders.forEach(function(o){ if (!beforeIds[o.id] && o.status === "Placed") alertNewOrder(o); });
     if ($("adminView").classList.contains("on") && adminUnlocked) renderAdmin();
   });
-}, 15000);
+}
+setInterval(pollTick, 15000);
+/* Catch up the MOMENT the owner looks at the tab again: browsers
+   throttle timers and drop sockets in background tabs, and a laptop
+   that slept can wake to a panel that missed everything — orders
+   placed while it slept, and accepts done on other devices. One
+   immediate tick on visible / focus / back-online closes that gap
+   instead of leaving stale orders (and stale alerts) on screen
+   until the next scheduled poll happens to succeed. */
+window.addEventListener("focus", function(){ pollTick(); });
+window.addEventListener("online", function(){ pollTick(); });
 </script>
 </body>
 </html>

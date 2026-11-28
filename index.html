@@ -1210,8 +1210,60 @@ function ensureAdminSession(cb){
     setTimeout(function(){ readStored(function(s2){ done(adopt(s2)); }); }, 1200);
   });
 }
+/* ================= ROUND 4 — THE AUTHENTICATED ROLE ITSELF IS BLOCKED =================
+   Round 3's live test finally isolated it: with a FRESH login, both
+   panel tabs showed "Sync error" from the first read and Accept
+   failed every time, yet BEFORE login the same page said "Live sync
+   ON" and customer-side status checks worked. Code inspection
+   confirms the split: every panel read / write goes through
+   sbAuthClient (role "authenticated" once signed in), while
+   everything that works — placing orders, the wt_order_statuses()
+   lookup — goes through sbClient (role "anon") or the
+   security-definer function. On the live database the
+   "authenticated" role has NO working SELECT / UPDATE permission
+   on public.orders (the setup SQL that grants them was never fully
+   applied there — the old upgrade SQL could even die halfway on a
+   duplicate-policy error), and PostgREST does not refuse such
+   requests with an error: it silently returns / updates ZERO rows.
+   That is why three rounds of session fixes could not cure it, and
+   why the real reason stayed invisible.
+   THIS ROUND:
+   - The REAL Supabase error (code + message + details + hint) is
+     kept in lastSyncErrorDetail and shown in the panel — the
+     diagnostic box, the Database test and the Accept failure
+     toast — instead of the old generic "internet check karo". A
+     silent zero-row answer is DIAGNOSED as what it is (an RLS
+     permission refusal), never mistaken for "the table is empty"
+     or "the write succeeded".
+   - Panel reads and writes stay AUTHENTICATED-ONLY and fail
+     closed. An anon fallback for the full orders table was
+     considered and REJECTED: it would hand every customer's name
+     and phone number to anyone holding the public key and
+     silently defeat the owner-only privacy setup. The sole remedy
+     is the RLS Fix SQL in the Database section, which the panel
+     now puts in front of the owner together with the diagnosis.
+   Multi-login remains innocent: Supabase allows the same admin
+   signed in on many devices at once; each device holds its own
+   session and one login never blocks another's reads. */
+var authRoleBlocked = false; /* diagnosed: the authenticated role lacks SELECT / UPDATE permission on orders */
+var lastSyncErrorDetail = "";
+function describeDbError(err){
+  if (!err) return "";
+  var parts = [];
+  if (err.code) parts.push("code " + err.code);
+  if (err.message) parts.push(String(err.message));
+  if (err.details) parts.push("details: " + String(err.details));
+  if (err.hint) parts.push("hint: " + String(err.hint));
+  return parts.join(" — ") || String(err);
+}
 function fetchCloudOrders(cb){
   if (!cloudEnabled || !sbClient) { if (cb) cb(false); return; }
+  /* Full-table reads are OWNER data (names, phone numbers, amounts):
+     they go out ONLY through the signed-in session. There is no
+     anon read of the orders table anywhere in the panel — not as a
+     fallback, not when locked. Customer devices use the
+     status-only RPC (fetchOwnOrderStatuses) instead. */
+  if (!adminUnlocked || !sbAuthClient) { if (cb) cb(false); return; }
   var healed = false; /* one session-refresh + retry per fetch, never a loop */
   function accept(rows){
     var fresh = (rows || []).map(rowToOrder);
@@ -1229,65 +1281,69 @@ function fetchCloudOrders(cb){
     } else {
       cloudOrders = fresh;
     }
+    if (fresh.length) authRoleBlocked = false;
     /* A verified signed-in read that STILL returns zero rows while
        this device knows orders exist is not believed as "the table
        is empty" — a half-applied RLS policy answers exactly like
        that. The cache above survives either way; the chip shows the
        error state instead of claiming Live over unseen data. */
     var suspiciousEmpty = adminUnlocked && !fresh.length && ((cloudOrders && cloudOrders.length) || loadOrders().length);
-    setSyncChip(suspiciousEmpty ? "error" : "live", suspiciousEmpty ? "Sync error" : "Live sync ON");
+    if (suspiciousEmpty) {
+      authRoleBlocked = true;
+      lastSyncErrorDetail = "Database ne logged-in (owner) read pe 0 orders bheje, jabki is device pe orders maujood hain. PostgREST aise hi chup-chaap 0 rows deta hai jab RLS policy logged-in (authenticated) role ko SELECT permission nahi deti — table khaali nahi hai, permission missing hai. Fix: neeche Database section wala RLS Fix SQL Supabase SQL Editor me ek baar chalao, phir Refresh dabao.";
+      setSyncChip("error", "Sync error");
+    } else {
+      lastSyncErrorDetail = "";
+      setSyncChip("live", "Live sync ON");
+    }
     if (cb) cb(true);
   }
-  function attempt(client, isRetry){
-    if (!client) { setSyncChip("error", "Sync error"); if (cb) cb(false); return; }
-    client.from("orders").select("*").order("created_at", { ascending:false }).limit(500)
-      .then(function(res){
-        if (res.error){
-          /* An auth error from the signed-in client means the token
-             died between the pre-read check and this request: heal
-             once and retry the SAME client. There is deliberately
-             NO fallback to the anon client while unlocked — under
-             the privacy RLS its "success" is a blind empty list,
-             which is exactly how stale statuses used to cement
-             themselves into the cache. */
-          if (client === sbAuthClient && adminUnlocked && !healed && isAuthError(res.error)){
-            healed = true;
-            healAdminSession(function(ok){
-              if (ok) { resubscribeRealtime(); attempt(sbAuthClient, true); }
-              else { confirmSessionGone(); if (cb) cb(false); }
-            });
+  function fail(err){
+    var d = describeDbError(err);
+    if (/permission|rls|policy|42501/i.test(d)) authRoleBlocked = true;
+    lastSyncErrorDetail = "Orders database se load nahi hue. Supabase error: " + (d || "network error") + " — panel fail-closed hai: bina valid owner permission ke koi order data nahi padha jata. Agar error me RLS / permission likha hai, to Database section wala RLS Fix SQL chalao.";
+    setSyncChip("error", "Sync error");
+    if (cb) cb(false);
+  }
+  function attempt(){
+    try {
+      sbAuthClient.from("orders").select("*").order("created_at", { ascending:false }).limit(500)
+        .then(function(res){
+          if (res.error){
+            /* An auth error from the signed-in client means the
+               token died between the pre-read check and this
+               request: heal once and retry the SAME client. There
+               is deliberately NO fallback to the anon client — under
+               the privacy RLS its data must never reach the panel,
+               and a blind anon read is also how stale statuses used
+               to cement themselves into the cache in round 2. */
+            if (!healed && isAuthError(res.error)){
+              healed = true;
+              healAdminSession(function(ok){
+                if (ok) { resubscribeRealtime(); attempt(); }
+                else { confirmSessionGone(); fail(res.error); }
+              });
+              return;
+            }
+            fail(res.error);
             return;
           }
-          setSyncChip("error", "Sync error"); if (cb) cb(false); return;
-        }
-        var rows = res.data || [];
-        /* An empty answer while this device knows orders exist is
-           accepted WITHOUT touching the session: accept() merges it
-           (nothing disappears) and flags the chip "Sync error" via
-           its suspicious-empty check. Round 2 refreshed the session
-           here on every such read — that refresh churn is what
-           killed fresh logins within seconds (see the ROUND 3 note
-           at ensureAdminSession), so it is deliberately gone. */
-        accept(rows);
-      }, function(){
-        setSyncChip("error", "Sync error"); if (cb) cb(false);
-      });
+          accept(res.data || []);
+        }, function(err){ fail(err); });
+    } catch(e){ fail(e); }
   }
-  if (adminUnlocked) {
-    /* Verify (and if needed refresh) the admin session FIRST, then
-       read through the signed-in client ONLY — the one client whose
-       role the RLS SELECT policy actually grants. No valid session
-       → no read and no fake success: the failure is reported, the
-       cache is left untouched, and a definitively dead login drops
-       the panel to the login screen. */
-    ensureAdminSession(function(ok){
-      if (!ok) { setSyncChip("error", "Sync error"); confirmSessionGone(); if (cb) cb(false); return; }
-      attempt(sbAuthClient, false);
-    });
-    return;
-  }
-  attempt(sbClient, false);
+  /* Verify (and if needed refresh) the admin session FIRST, then
+     read through the signed-in client ONLY — the one client whose
+     role the RLS SELECT policy actually grants. No valid session
+     → no read and no fake success: the failure is reported with its
+     real reason, the cache is left untouched, and a definitively
+     dead login drops the panel to the login screen. */
+  ensureAdminSession(function(ok){
+    if (!ok) { setSyncChip("error", "Sync error"); confirmSessionGone(); if (cb) cb(false); return; }
+    attempt();
+  });
 }
+
 function insertCloudOrder(o, cb){
   if (!cloudEnabled || !sbClient) { cb(false, "not configured"); return; }
   insertRowTolerant(orderToRow(o)).then(function(res){
@@ -1300,57 +1356,105 @@ function insertCloudOrder(o, cb){
 /* VERIFIED WRITE — success means the DATABASE shows the new status,
    not merely "no error came back". The update is sent with
    .select() so PostgREST returns the rows it actually changed: a
-   write that RLS silently filters (stale token) returns no error
-   and ZERO rows, which used to pass as success while the order
-   stayed Placed in the database. Zero (or mismatched) rows trigger
-   a read-back of the row; only a read-back — or the update's own
-   returned row — showing the requested status counts as success.
-   An auth-looking error gets ONE session heal + resend; anything
-   else is reported as failure, honestly and immediately. */
+   write that RLS silently filters (stale token, or a role with no
+   UPDATE permission) returns no error and ZERO rows, which used to
+   pass as success while the order stayed Placed in the database
+   (proven live in round 2). Zero (or mismatched) rows trigger
+   verification — first through the security-definer
+   wt_order_statuses() function (it returns only id + status for the
+   exact order asked about), then a direct read-back through the
+   same signed-in client — and success is reported ONLY when the
+   database itself shows the requested status.
+   ROUND 4 — REAL ERROR, AUTHENTICATED-ONLY: the write goes through
+   the signed-in (authenticated) client ONLY. There is no anon
+   retry: status writes are owner actions, and an anon write path
+   would let anyone holding the public key change any order's
+   status. When the write cannot land, the caller gets
+   cb(false, detail) carrying the full diagnosis — a real Supabase
+   error keeps its code + message, and a silent zero-row update is
+   named as the RLS permission refusal it is — so the panel shows
+   the asli wajah instead of "internet check karo", and the RLS Fix
+   SQL (Database section) is the remedy. An auth-looking error
+   still gets ONE session heal + resend. */
 function updateCloudStatus(id, status, cb){
-  if (!cloudEnabled || !sbClient) { cb(false); return; }
+  if (!cloudEnabled || !sbClient) { if (cb) cb(false, "Live Sync connected nahi hai — ye device Local only mode me hai."); return; }
+  if (!adminUnlocked || !sbAuthClient) { if (cb) cb(false, "Owner login ke bina status database me save nahi ho sakta — pehle Owner Panel me login karo."); return; }
   var healed = false;
-  function verifyBack(client, done){
+  var attempts = [];
+  function verifyViaRpc(done){
     try {
-      client.from("orders").select("id,status").eq("id", id).then(function(r){
-        if (r.error || !r.data || !r.data.length) { done(false); return; }
+      sbClient.rpc("wt_order_statuses", { ids:[id] }).then(function(r){
+        if (r.error || !Array.isArray(r.data) || !r.data.length) { done(false); return; }
         done(String(r.data[0].status) === String(status));
       }, function(){ done(false); });
     } catch(e){ done(false); }
   }
-  function send(done){
-    var client = ordersReadClient();
+  function verifyBack(done){
+    verifyViaRpc(function(ok){
+      if (ok) { done(true); return; }
+      try {
+        sbAuthClient.from("orders").select("id,status").eq("id", id).then(function(r){
+          if (r.error || !r.data || !r.data.length) { done(false); return; }
+          done(String(r.data[0].status) === String(status));
+        }, function(){ done(false); });
+      } catch(e){ done(false); }
+    });
+  }
+  function finishFail(detail){
+    var d = detail || ("Status database me save nahi hua (" + id + " → " + status + "). " + attempts.join(" | ") + " Fix: Database section wala RLS Fix SQL Supabase SQL Editor me ek baar chalao — uske baad Accept isi panel se pakka save hoga.");
+    lastSyncErrorDetail = d;
+    setSyncChip("error", "Sync error");
+    if (cb) cb(false, d);
+  }
+  function send(){
     try {
-      client.from("orders").update({ status:status }).eq("id", id).select("id,status").then(function(res){
-        if (res.error) { done(false, res.error); return; }
+      sbAuthClient.from("orders").update({ status:status }).eq("id", id).select("id,status").then(function(res){
+        if (res.error) {
+          attempts.push("Owner (logged-in / authenticated) access — Supabase error: " + describeDbError(res.error));
+          afterSend(false, res.error);
+          return;
+        }
         var rows = res.data || [];
-        if (rows.length && String(rows[0].status) === String(status)) { done(true); return; }
+        if (rows.length && String(rows[0].status) === String(status)) { afterSend(true, null); return; }
         /* No error, but the update changed nothing we can see —
            verify against the database itself before believing it. */
-        verifyBack(client, function(ok){ done(ok, null); });
-      }, function(){ done(false, null); });
-    } catch(e){ done(false, null); }
-  }
-  function go(){
-    send(function(ok, err){
-      if (ok) { setSyncChip("live", "Live sync ON"); cb(true); return; }
-      if (adminUnlocked && !healed && isAuthError(err)){
-        healed = true;
-        healAdminSession(function(hok){
-          if (hok) { resubscribeRealtime(); send(function(ok2){ if (ok2) setSyncChip("live", "Live sync ON"); cb(!!ok2); }); }
-          else { confirmSessionGone(); cb(false); }
+        verifyBack(function(ok){
+          if (!ok) {
+            authRoleBlocked = true;
+            attempts.push("Owner (logged-in / authenticated) access — Supabase ne koi error NAHI diya, lekin 0 rows update hue. Ye silent RLS refusal hai: logged-in (authenticated) role ko orders pe UPDATE permission (policy + grant) nahi mili.");
+          }
+          afterSend(ok, null);
         });
-        return;
-      }
-      cb(false);
-    });
+      }, function(err){ attempts.push("Owner (logged-in / authenticated) access — network error: " + ((err && err.message) || "koi jawab nahi aaya")); afterSend(false, null); });
+    } catch(e){ attempts.push("Owner (logged-in / authenticated) access — " + ((e && e.message) || "error")); afterSend(false, null); }
+  }
+  function afterSend(ok, err){
+    if (ok) {
+      authRoleBlocked = false;
+      lastSyncErrorDetail = "";
+      setSyncChip("live", "Live sync ON"); /* a real, verified write just landed — sync is provably live */
+      if (cb) cb(true, "");
+      return;
+    }
+    if (!healed && isAuthError(err)) {
+      healed = true;
+      healAdminSession(function(hok){
+        if (hok) { resubscribeRealtime(); send(); }
+        else { confirmSessionGone(); finishFail(); }
+      });
+      return;
+    }
+    finishFail();
   }
   /* Verify the session BEFORE the write (storage re-read + at most
      one leader-led refresh — see ensureAdminSession), so an Accept
      tapped in a long-open tab goes out with a live token. */
-  if (adminUnlocked) ensureAdminSession(function(ok){ if (!ok) { confirmSessionGone(); cb(false); return; } go(); });
-  else go();
+  ensureAdminSession(function(ok){
+    if (!ok) { confirmSessionGone(); finishFail("Status database me save nahi hua (" + id + " → " + status + "). Login session verify nahi hua — panel dobara login karke try karo. Agar login ke baad bhi ye aaye, to Database section wala RLS Fix SQL chalao."); return; }
+    send();
+  });
 }
+
 /* Customer-side status lookup: returns ONLY {id, status} for the
    orders placed on THIS phone — never the full orders table, never
    other customers' names or phone numbers. Prefers the database's
@@ -1992,6 +2096,16 @@ var SQL_SCHEMA = "create table public.orders (\n  id text primary key,\n  table_
    order's status through wt_order_statuses(), which returns nothing
    but id + status for the exact order ids asked about. */
 var SQL_UPGRADE = "drop policy if exists \"anon and admin can read orders\" on public.orders;\ndrop policy if exists \"anon and admin can update status only\" on public.orders;\ncreate policy \"admin can read orders\" on public.orders\n  for select to authenticated using (true);\ncreate policy \"admin can update status only\" on public.orders\n  for update to authenticated using (true)\n  with check (status in ('Placed','Accepted','Preparing','Ready','Completed','Cancelled'));\nrevoke select, update on table public.orders from anon;\ngrant select on table public.orders to authenticated;\ngrant update (status) on table public.orders to authenticated;\ncreate or replace function public.wt_order_statuses(ids text[])\n  returns table (id text, status text)\n  language sql security definer set search_path = public\n  as $$ select o.id, o.status from public.orders o where o.id = any(ids) $$;\nrevoke all on function public.wt_order_statuses(text[]) from public;\ngrant execute on function public.wt_order_statuses(text[]) to anon, authenticated;";
+/* RLS FIX — the one SQL the owner runs when the panel shows
+   "Sync error" from login, or Accept says "Status database me save
+   NAHI hua": it (re)creates the authenticated role's SELECT +
+   status-UPDATE policies AND grants, whatever state the project is
+   in. Every policy is dropped-if-exists first, so — unlike the
+   older upgrade SQL — a re-run can never die halfway on a
+   duplicate-policy error; running it twice is harmless. It also
+   re-normalises the customer side (anon can only INSERT a Placed
+   order, never read or update) and the status-lookup function. */
+var SQL_FIX_RLS = "-- Wok Tales RLS FIX — logged-in owner (authenticated) ko orders padhne + status badalne ki permission\n-- Kab chalaye: panel me login karte hi \"Sync error\" aaye, ya Accept dabane pe \"Status database me save NAHI hua\" aaye.\n-- Ye SQL idempotent hai — dobara chalana bilkul safe hai, kuch bigdega nahi.\nalter table public.orders enable row level security;\ndrop policy if exists \"anon and admin can read orders\" on public.orders;\ndrop policy if exists \"anon and admin can update status only\" on public.orders;\ndrop policy if exists \"admin can read orders\" on public.orders;\ncreate policy \"admin can read orders\" on public.orders\n  for select to authenticated using (true);\ndrop policy if exists \"admin can update status only\" on public.orders;\ncreate policy \"admin can update status only\" on public.orders\n  for update to authenticated using (true)\n  with check (status in ('Placed','Accepted','Preparing','Ready','Completed','Cancelled'));\ndrop policy if exists \"anon can place orders\" on public.orders;\ncreate policy \"anon can place orders\" on public.orders\n  for insert to anon with check (status = 'Placed');\nrevoke select, update on table public.orders from anon;\ngrant select on table public.orders to authenticated;\ngrant update (status) on table public.orders to authenticated;\ngrant insert on table public.orders to anon, authenticated;\ncreate or replace function public.wt_order_statuses(ids text[])\n  returns table (id text, status text)\n  language sql security definer set search_path = public\n  as $$ select o.id, o.status from public.orders o where o.id = any(ids) $$;\nrevoke all on function public.wt_order_statuses(text[]) from public;\ngrant execute on function public.wt_order_statuses(text[]) to anon, authenticated;";
 /* ================= RENDER MENU ================= */
 function controlHTML(id){
   var q = cart[id] || 0;
@@ -2482,7 +2596,7 @@ function renderAdmin(){
       + '<div id="adminPassErr" style="color:var(--red-dark);font-weight:700;font-size:.82rem;margin-top:8px;"></div>'
       + '<button class="placebtn" id="adminLoginBtn" style="margin-top:14px;">Login to Owner Panel</button>'
       + '<div class="notebox"><b>Pehli baar setup — sirf ek baar, 1 minute:</b> Admin account is website ke code me nahi hai, wo <b>Supabase</b> me banta hai. supabase.com → apna project <b>Woktaless</b> → <b>Authentication → Users → Add user</b> → email <b>woktalessikar@gmail.com</b> aur apna fixed admin password daalo, <b>Auto Confirm User ON</b> rakho, Create dabao. Uske baad yahi email + password yahan login pe chalega, aur email / phone / password badalna ho to panel ke andar <b>Admin account &amp; settings</b> se badlega.</div>'
-      + '<div class="notebox">' + (cloudEnabled ? '<b>Live Sync is ON:</b> this panel shows live orders from every customer phone (Supabase database). New orders arrive here automatically.' : 'This panel is in <b>Local only</b> mode — it shows orders placed on this device only. Admin login ke liye Live Sync (Supabase) connection chahiye.') + '</div></div>';
+      + '<div class="notebox">' + (cloudEnabled ? '<b>Database (Supabase) connected hai.</b> Sync ka abhi ka status: <b>' + esc(syncState.text) + '</b> — jab status "Live sync ON" hota hai, har customer phone ke orders is panel me apne aap aate hain. Agar "Sync error" dikhe to login ke baad panel me asli wajah aur uska Fix SQL milega.' : 'This panel is in <b>Local only</b> mode — it shows orders placed on this device only. Admin login ke liye Live Sync (Supabase) connection chahiye.') + '</div></div>';
     $("adminLoginBtn").addEventListener("click", tryAdminLogin);
     ["adminEmailInput","adminPhoneInput","adminPassInput"].forEach(function(id){ var el = $(id); if (el) el.addEventListener("keydown", function(e){ if(e.key==="Enter") tryAdminLogin(); }); });
     return;
@@ -2502,7 +2616,7 @@ function renderAdmin(){
   var statusOpts = ["All"].concat(STATUSES).map(function(s){ return '<option value="'+s+'"'+(adminStatusFilter===s?" selected":"")+'>'+(s==="All"?"All statuses":s)+'</option>'; }).join("");
 
   var ordersHTML = "";
-  if (!list.length) ordersHTML = '<div class="panelcard" style="text-align:center;padding:28px;"><b>No orders in this view yet</b><div style="color:var(--ink2);font-weight:600;font-size:.86rem;margin-top:4px;">' + (cloudEnabled ? 'Live Sync is ON — when a customer places an order on any phone, it will appear here automatically.' : 'When a customer places an order on this device, it will appear here. Connect Supabase below to receive orders from every phone.') + '</div></div>';
+  if (!list.length) ordersHTML = '<div class="panelcard" style="text-align:center;padding:28px;"><b>No orders in this view yet</b><div style="color:var(--ink2);font-weight:600;font-size:.86rem;margin-top:4px;">' + (cloudEnabled ? (syncState.state === "live" ? 'Live Sync is ON — when a customer places an order on any phone, it will appear here automatically.' : 'Database connected hai, lekin abhi sync live nahi hai (status: ' + esc(syncState.text) + '). Customer ke orders yahan tabhi dikhenge jab sync theek hoga — upar wale box me asli wajah aur Fix SQL diya hai.') : 'When a customer places an order on this device, it will appear here. Connect Supabase below to receive orders from every phone.') + '</div></div>';
   list.forEach(function(o){
     var linesHTML = (o.lines||[]).map(function(l){ return '<div><b>'+l.qty+' × '+esc(l.name)+'</b> — '+inr(l.qty*l.price)+'</div>'; }).join("");
     var next = NEXT_STATUS[o.status];
@@ -2520,7 +2634,17 @@ function renderAdmin(){
   var tablesHTML = tables.length ? tables.map(function(t){ return '<b>'+esc(t[0])+'</b>: '+t[1]+' order'+(t[1]===1?"":"s")+' &nbsp; '; }).join("") : "—";
   var savedQrLink = getQrLink();
 
+  /* Sync diagnostic — the REAL reason (lastSyncErrorDetail, filled
+     by the read / write paths with the actual Supabase error or the
+     silent-zero RLS diagnosis) plus the one SQL that fixes it. The
+     Fix SQL block is reused in the Database section below. */
+  var fixSqlBlock = '<details class="sqlwrap"><summary>RLS Fix SQL — Sync error / Accept save na ho to ye chalao (tap to open)</summary><div class="sqlbox">' + esc(SQL_FIX_RLS) + '</div><button class="btn small copyFixSqlBtn" type="button" style="margin-top:8px;">Copy Fix SQL</button><p style="font-size:.78rem;color:var(--ink2);font-weight:600;line-height:1.5;">Supabase → apna project → SQL Editor → ye poora SQL paste karke <b>Run</b> dabao. Ek baar ka kaam hai aur dobara chalana bhi safe hai (idempotent). Uske baad panel pe <b>Refresh</b> dabao — Accept phir database me pakka save hoga, aur orders sirf logged-in owner ko dikhenge.</p></details>';
+  var diagHTML = "";
+  if (lastSyncErrorDetail) diagHTML = '<div class="panelcard" style="border-color:var(--red);"><h4>⚠ Sync problem — asli wajah</h4><p style="margin:0 0 6px;color:var(--ink2);font-weight:600;font-size:.86rem;line-height:1.55;">' + esc(lastSyncErrorDetail) + '</p>' + fixSqlBlock + '</div>';
+  else if (authRoleBlocked) diagHTML = '<div class="panelcard" style="border-color:#d9a400;"><h4>⚠ Logged-in (owner) access ko database permission nahi mili</h4><p style="margin:0 0 6px;color:var(--ink2);font-weight:600;font-size:.86rem;line-height:1.55;">Isi liye kuch orders panel me nahi dikh sakte, aur Accept database me save nahi hoga. Panel jaan-boojh ke customer (anon) access se orders NAHI padhta aur status NAHI badalta — warna har customer ka naam / phone kisi ko bhi dikh sakta tha. Ekmatra fix: neeche wala RLS Fix SQL Supabase SQL Editor me ek baar chalao.</p>' + fixSqlBlock + '</div>';
+
   body.innerHTML = tabsHTML
+    + diagHTML
     + '<div class="statsgrid">'
     + '<div class="statcard"><span>Orders</span><b>'+st.count+'</b><small>in this view</small></div>'
     + '<div class="statcard"><span>Revenue</span><b>'+inr(st.revenue)+'</b><small>incl. GST, excl. cancelled</small></div>'
@@ -2558,7 +2682,7 @@ function renderAdmin(){
     + '<div class="dbstatus" id="dbStatus">Status: <b id="dbSyncMirror">' + esc(syncState.text) + '</b>' + (cloudEnabled ? ' — orders sync with Supabase.' : ' — no database connected. Orders are stored on each device only.') + (loadPending().length ? '<br/>Pending orders waiting to sync: <b>'+loadPending().length+'</b>' : '') + '</div>'
     + '<details class="sqlwrap"><summary>Table SQL — for a NEW Supabase project (tap to open)</summary><div class="sqlbox" id="sqlBox">'+esc(SQL_SCHEMA)+'</div><button class="btn small" id="copySqlBtn" type="button" style="margin-top:8px;">Copy SQL</button></details>'
     + '<div class="notebox"><b>Customer phone numbers (optional column):</b> checkout pe customer apna phone number bhi de sakta hai (optional hai). Use database me store karne ke liye Supabase SQL Editor me ye ek line chalao: <b>alter table public.orders add column if not exists phone text;</b> Jab tak ye column nahi hai, orders phir bhi bilkul normal place honge — bas phone number database me save nahi hoga. Column add hote hi phone apne aap har order ke saath save hone lagega, is panel me dikhega aur CSV me bhi aayega.</div>'
-    + '<details class="sqlwrap"><summary>Privacy upgrade SQL — purane project ke liye (ek baar chalao)</summary><div class="sqlbox" id="upgradeSqlBox">'+esc(SQL_UPGRADE)+'</div><button class="btn small" id="copyUpgradeSqlBtn" type="button" style="margin-top:8px;">Copy upgrade SQL</button><p style="font-size:.78rem;color:var(--ink2);font-weight:600;line-height:1.5;">Ye chalane ke baad orders sirf <b>logged-in owner</b> padh sakega — customer naam / phone number kisi aur ko nahi dikhenge. Customers order phir bhi place kar sakenge aur apne order ka status bhi dekh sakenge (status-only function se). Owner Panel band karke dobara kholo to naya setup apply ho jayega.</p></details>'
+    + '<details class="sqlwrap"><summary>Privacy upgrade SQL — purane project ke liye (ek baar chalao)</summary><div class="sqlbox" id="upgradeSqlBox">'+esc(SQL_UPGRADE)+'</div><button class="btn small" id="copyUpgradeSqlBtn" type="button" style="margin-top:8px;">Copy upgrade SQL</button><p style="font-size:.78rem;color:var(--ink2);font-weight:600;line-height:1.5;">Ye chalane ke baad orders sirf <b>logged-in owner</b> padh sakega — customer naam / phone number kisi aur ko nahi dikhenge. Customers order phir bhi place kar sakenge aur apne order ka status bhi dekh sakenge (status-only function se). Owner Panel band karke dobara kholo to naya setup apply ho jayega.</p></details>' + fixSqlBlock
     + '</div>'
     + '<div class="panelcard"><h4>Admin account &amp; settings</h4>'
     + '<p style="margin:0 0 4px;color:var(--ink2);font-weight:600;font-size:.86rem;line-height:1.55;">Yahi se admin apna <b>login email</b>, <b>phone</b> aur <b>password</b> badal sakta hai. Change sirf panel ke andar se hota hai — bahar se koi password reset nahi kar sakta. Change Supabase account pe save hota hai, isliye agli login pe har device pe naya wala chalega. Email badalne pe Supabase naye email pe confirmation bhej sakta hai — wo confirm karne ke baad hi naya email login pe chalega.</p>'
@@ -2568,7 +2692,7 @@ function renderAdmin(){
     + '<div class="field"><label for="newPass">Change admin password</label><input id="newPass" type="password" placeholder="New password (min 6 characters)" autocomplete="new-password" /></div>'
     + '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;"><button class="btn" id="savePassBtn" type="button">Save new password</button><button class="btn" id="clearDoneBtn" type="button">Clear completed / cancelled</button><button class="btn" id="lockAdminBtn" type="button">Lock panel</button></div>'
     + '<div id="confirmBox"></div>'
-    + '<div class="notebox">Data note: ' + (cloudEnabled ? 'Live Sync is ON — orders live in your Supabase database and appear on every device. A copy of orders placed on this device is also kept in this browser.' : 'Local only mode — orders are saved only in this browser (local storage) on this device. Clearing browser data will clear them — export CSV regularly. Connect Supabase above for one live list across all phones.') + '</div></div>';
+    + '<div class="notebox">Data note: ' + (!cloudEnabled ? 'Local only mode — orders are saved only in this browser (local storage) on this device. Clearing browser data will clear them — export CSV regularly. Connect Supabase above for one live list across all phones.' : (syncState.state === "live" ? 'Live Sync is ON — orders live in your Supabase database and appear on every device. A copy of orders placed on this device is also kept in this browser.' : 'Database connected hai, lekin abhi sync ka status hai: <b>' + esc(syncState.text) + '</b> — jab tak status "Live sync ON" na ho, har device pe orders dikhne ki guarantee nahi hai. Wajah aur uska Fix SQL panel ke upar wale box aur Database section me diya hai.')) + '</div></div>';
 
   body.querySelectorAll("[data-range]").forEach(function(b){ b.addEventListener("click", function(){ adminRange=b.getAttribute("data-range"); renderAdmin(); }); });
   var si=$("adminSearch"); if(si) si.addEventListener("input", function(){ adminSearch=this.value; var pos=this.selectionStart; renderAdmin(); var n=$("adminSearch"); if(n){ n.focus(); try{n.setSelectionRange(pos,pos);}catch(e){} } });
@@ -2584,16 +2708,50 @@ function renderAdmin(){
   var tdb=$("testDbBtn"); if(tdb) tdb.addEventListener("click", function(){
     var st=$("dbStatus");
     if(!cloudEnabled || !sbClient){ if(st){ st.className="dbstatus err"; st.innerHTML="Test failed: <b>no database connected</b>. Paste the URL + anon key and tap Save &amp; connect first."; } return; }
-    if(st){ st.className="dbstatus"; st.textContent="Testing connection…"; }
-    ordersReadClient().from("orders").select("id").limit(1).then(function(res){
-      if(!st) return;
-      if(res.error){ st.className="dbstatus err"; st.innerHTML="Test failed: <b>"+esc(res.error.message||"unknown error")+"</b><br/>Most common cause: the orders table / SQL has not been run yet, or RLS policies are missing — ya panel login nahi hai (order reads sirf logged-in owner ko milte hain). Run the Table SQL below in Supabase SQL Editor, then test again."; setSyncChip("error","Sync error"); }
-      else { st.className="dbstatus ok"; st.innerHTML="Test passed ✓ — connected to Supabase and the <b>orders</b> table is readable. Status: <b id=\"dbSyncMirror\">Live sync ON</b>"; setSyncChip("live","Live sync ON"); }
-    }, function(err){ if(st){ st.className="dbstatus err"; st.textContent="Test failed: network error — " + ((err&&err.message)||"could not reach Supabase"); } setSyncChip("error","Sync error"); });
+    if(st){ st.className="dbstatus"; st.textContent="Testing connection — dono access paths (owner login + customer) check ho rahe hain…"; }
+    /* Test BOTH roles separately and report each one's REAL result:
+       the round-4 bug was invisible precisely because the old test
+       read through one client and called any no-error answer a
+       pass — while the signed-in role was silently getting zero
+       rows. Now: an error shows its code + message, and "owner got
+       0 rows but customer got rows" is diagnosed as the missing
+       authenticated RLS permission it is. */
+    function runTest(client){
+      try { return client.from("orders").select("id").limit(5).then(function(res){ return res; }, function(err){ return { error:(err || { message:"network error" }), data:null }; }); }
+      catch(e){ return Promise.resolve({ error:e, data:null }); }
+    }
+    var authTest = (adminUnlocked && sbAuthClient) ? runTest(sbAuthClient) : Promise.resolve(null);
+    authTest.then(function(authRes){
+      runTest(sbClient).then(function(anonRes){
+        if(!st) return;
+        var authRows = (authRes && !authRes.error) ? (authRes.data || []).length : -1;
+        var anonRows = (anonRes && !anonRes.error) ? (anonRes.data || []).length : -1;
+        var lines = [];
+        lines.push("Owner (logged-in) read: " + (!authRes ? "abhi login nahi hai — pehle panel login karke test karo" : (authRes.error ? "<b>FAIL — " + esc(describeDbError(authRes.error)) + "</b>" : "<b>OK</b> (" + authRows + " order rows mile)")));
+        lines.push("Customer (anon) read: " + (anonRes.error ? "<b>FAIL — " + esc(describeDbError(anonRes.error)) + "</b>" : "<b>OK</b> (" + anonRows + " order rows mile)"));
+        var bad = false, verdict = "";
+        if (authRes && !authRes.error && !anonRes.error && authRows === 0 && anonRows > 0) {
+          bad = true; authRoleBlocked = true;
+          verdict = "<b>Diagnosis: RLS permission missing.</b> Customer access ko orders dikh rahe hain, lekin logged-in owner access ko 0 mile — database me <b>authenticated</b> role ko SELECT / UPDATE permission nahi mili. Isi wajah se Accept database me save nahi hota. Neeche wala <b>RLS Fix SQL</b> Supabase SQL Editor me ek baar chalao — sab theek ho jayega.";
+          lastSyncErrorDetail = "Connection test diagnosis: logged-in (authenticated) access ko orders pe 0 rows mile jabki customer (anon) access ko orders dikhe — authenticated role ko SELECT / UPDATE ki RLS permission missing hai. Database section wala RLS Fix SQL chalao.";
+        } else if ((authRes && authRes.error) || anonRes.error) {
+          bad = true;
+          verdict = "<b>Ek ya dono reads fail hue</b> — upar asli Supabase error (code + message) diya hai. Agar error me RLS / permission / policy likha hai to neeche wala <b>RLS Fix SQL</b> chalao; agar orders table missing hai to Table SQL chalao.";
+          lastSyncErrorDetail = "Connection test fail hua. " + (authRes && authRes.error ? "Owner read: " + describeDbError(authRes.error) + ". " : "") + (anonRes.error ? "Customer read: " + describeDbError(anonRes.error) + "." : "");
+        } else {
+          verdict = "<b>Sab theek hai</b> — dono access paths orders padh pa rahe hain.";
+          lastSyncErrorDetail = "";
+        }
+        st.className = "dbstatus " + (bad ? "err" : "ok");
+        st.innerHTML = lines.join("<br/>") + "<br/>" + verdict + '<br/>Status: <b id="dbSyncMirror">' + esc(syncState.text) + "</b>";
+        if (bad) setSyncChip("error", "Sync error"); else setSyncChip("live", "Live sync ON");
+      });
+    });
   });
   var cdb=$("clearDbBtn"); if(cdb) cdb.addEventListener("click", function(){ disconnectDb(); try{ if(realtimeClient && realtimeChannel) realtimeClient.removeChannel(realtimeChannel); }catch(e){} realtimeChannel=null; realtimeClient=null; cloudOrders=null; initSupabase(); renderAdmin(); toast("Database disconnected on this device — Local only mode"); });
   var csq=$("copySqlBtn"); if(csq) csq.addEventListener("click", function(){ if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(SQL_SCHEMA).then(function(){ toast("SQL copied — paste it in Supabase SQL Editor"); }, function(){ fallbackCopy(SQL_SCHEMA); toast("SQL copied"); }); else { fallbackCopy(SQL_SCHEMA); toast("SQL copied"); } });
   var cuq=$("copyUpgradeSqlBtn"); if(cuq) cuq.addEventListener("click", function(){ if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(SQL_UPGRADE).then(function(){ toast("Upgrade SQL copied — paste it in Supabase SQL Editor"); }, function(){ fallbackCopy(SQL_UPGRADE); toast("Upgrade SQL copied"); }); else { fallbackCopy(SQL_UPGRADE); toast("Upgrade SQL copied"); } });
+  body.querySelectorAll(".copyFixSqlBtn").forEach(function(b){ b.addEventListener("click", function(){ if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(SQL_FIX_RLS).then(function(){ toast("Fix SQL copied — Supabase SQL Editor me paste karke Run dabao"); }, function(){ fallbackCopy(SQL_FIX_RLS); toast("Fix SQL copied"); }); else { fallbackCopy(SQL_FIX_RLS); toast("Fix SQL copied"); } }); });
   var ex=$("exportCsvBtn"); if(ex) ex.addEventListener("click", exportCSV);
   var enb=$("enableNotifyBtn"); if(enb) enb.addEventListener("click", function(){ requestNotifyPermission(function(res){ renderAdmin(); toast(res === "granted" ? "Notifications ON — naya order aane pe notification + awaaz aayegi" : res === "denied" ? "Notification blocked hai — browser settings se is site ke liye Allow karo" : res === "unsupported" ? "Is browser me notification nahi chalta — screen alert + awaaz chalega" : "Permission nahi mili — dobara try karo"); }); });
   var tab=$("testAlertBtn"); if(tab) tab.addEventListener("click", function(){ beep(); });
@@ -2725,13 +2883,13 @@ function setOrderStatus(id, status){
     if (statusWriteInFlight[id]) { toast("Ye status pehle se database me save ho raha hai — ek second…"); return; }
     statusWriteInFlight[id] = true;
     toast("Database me save ho raha hai…");
-    updateCloudStatus(id, status, function(ok){
+    updateCloudStatus(id, status, function(ok, detail){
       delete statusWriteInFlight[id];
       if (ok) { applyOrderStatus(id, status); toast(id+" → "+status); }
       else {
         setSyncChip("error", "Sync error");
         renderAdmin();
-        toast("✗ Status database me save NAHI hua — order abhi bhi pehle jaisa hi hai (Accepted nahi hua). Internet check karke dobara try karo.");
+        toast("✗ Status database me save NAHI hua — order abhi bhi pehle jaisa hi hai (Accepted nahi hua). Asli wajah: " + (detail || lastSyncErrorDetail || "panel ke upar wale laal box me dekho"));
       }
     });
     return;
@@ -2775,7 +2933,9 @@ var toastTimer = null;
 function toast(msg){
   var t = $("toast"); t.textContent = msg; t.classList.add("on");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(function(){ t.classList.remove("on"); }, 2400);
+  /* A long message (e.g. the real reason an Accept failed) stays up
+     long enough to actually read; short confirmations stay snappy. */
+  toastTimer = setTimeout(function(){ t.classList.remove("on"); }, (msg && msg.length > 90) ? 7000 : 2400);
 }
 document.addEventListener("keydown", function(e){ if (e.key === "Escape"){ closeSheet(); } });
 updateCartBar();
